@@ -1,8 +1,5 @@
-cd /opt/polaris-phase-engine
-
-cat > requirements.txt << 'EOF'
-python-dotenv
+flask
 requests
 pandas
 numpy
-EOF
+python-dotenv
