@@ -1,17 +1,20 @@
-# Python
+# байткод / кеши
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
 
-# venv
+# виртуальные окружения
+.venv/
 venv/
+
+# локальные настройки
 .env
+.env.*
+*.log
 
 # IDE
 .vscode/
 .idea/
-*.iml
 
-# misc
-*.log
+# прочее
+.DS_Store
