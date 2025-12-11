@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ SYMBOLS: List[str] = [s.strip().upper() for s in _raw_symbols.split(",") if s.st
 INTERVAL = os.getenv("PPE_INTERVAL", "4h")
 KLINES_LIMIT = int(os.getenv("PPE_KLINES_LIMIT", "500"))
 
-# Параметры, синхронные с PolarisPhaseMVP
+# Параметры фаз (синхронны с PolarisPhaseMVP)
 EMA_FAST = int(os.getenv("PPE_EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("PPE_EMA_SLOW", "50"))
 TREND_UP_THR = float(os.getenv("PPE_TREND_UP_THR", "0.0015"))
@@ -43,7 +43,7 @@ MIN_BARS_IN_PHASE_FOR_SIGNAL = int(
     os.getenv("PPE_MIN_BARS_IN_PHASE_FOR_SIGNAL", "2")
 )
 
-# --- CONF-логика ---
+# --- Wyckoff CONF на младшем ТФ (по умолчанию 1h) ---
 
 CONF_ENABLED = os.getenv("PPE_CONFIRM_ENABLED", "true").lower() in (
     "1",
@@ -51,35 +51,24 @@ CONF_ENABLED = os.getenv("PPE_CONFIRM_ENABLED", "true").lower() in (
     "yes",
     "on",
 )
-
-# рабочий ТФ для подтверждения (1h)
 CONF_INTERVAL = os.getenv("PPE_CONFIRM_INTERVAL", "1h")
 CONF_KLINES_LIMIT = int(os.getenv("PPE_CONFIRM_KLINES_LIMIT", "200"))
-
-# максимум "возраст" PRE (часы) для CONF
 CONF_MAX_AGE_HOURS = float(os.getenv("PPE_CONFIRM_MAX_AGE_HOURS", "24"))
 
-# максимум длины фазы (в барах 4H), после которой CONF уже не даём
-CONF_MAX_PHASE_BARS = int(os.getenv("PPE_CONFIRM_MAX_PHASE_BARS", "6"))
+# TR/спринг/UT параметры
+WYC_TR_BARS = int(os.getenv("PPE_WYC_TR_BARS", "24"))          # размер окна TR (в барах CONF_INTERVAL)
+WYC_MIN_TR_BARS = int(os.getenv("PPE_WYC_MIN_TR_BARS", "8"))   # минимум баров в TR
+WYC_TR_MAX_RANGE_PCT = float(os.getenv("PPE_WYC_TR_MAX_RANGE_PCT", "0.03"))  # макс. высота TR, напр. 3%
 
-# сколько 1h-баров смотрим назад для отката
-CONF_PULLBACK_LOOKBACK = int(os.getenv("PPE_CONFIRM_PULLBACK_LOOKBACK", "6"))
+WYC_SPRING_BREAK_PCT = float(os.getenv("PPE_WYC_SPRING_BREAK_PCT", "0.002"))  # насколько низко выходить ниже TR-низа
+WYC_SPRING_WICK_RATIO = float(os.getenv("PPE_WYC_SPRING_WICK_RATIO", "0.6"))  # доля нижней тени от спреда
+WYC_SPRING_VOL_MULT = float(os.getenv("PPE_WYC_SPRING_VOL_MULT", "1.5"))      # объём на спринг-баре
 
-# объём на откате не должен быть больше этого множителя от медианы
-CONF_PULLBACK_VOL_MAX_MULT = float(
-    os.getenv("PPE_CONFIRM_PULLBACK_VOL_MAX_MULT", "1.5")
-)
+WYC_UT_BREAK_PCT = float(os.getenv("PPE_WYC_UT_BREAK_PCT", "0.002"))          # выход выше TR-верха
+WYC_UT_WICK_RATIO = float(os.getenv("PPE_WYC_UT_WICK_RATIO", "0.6"))          # верхняя тень
+WYC_UT_VOL_MULT = float(os.getenv("PPE_WYC_UT_VOL_MULT", "1.5"))
 
-# объём на подтверждающей свече должен быть больше этого множителя от медианы
-CONF_CONFIRM_VOL_MIN_MULT = float(
-    os.getenv("PPE_CONFIRM_CONFIRM_VOL_MIN_MULT", "1.2")
-)
-
-# допуск по цене относительно EMA (0.002 = 0.2%)
-CONF_PRICE_EPS = float(os.getenv("PPE_CONFIRM_PRICE_EPS", "0.002"))
-
-# на сколько максимум цена может уйти за хай/лоу 4H-бара PRE (0.015 = 1.5%)
-CONF_MAX_BREAKOUT_4H = float(os.getenv("PPE_CONFIRM_MAX_BREAKOUT_4H", "0.015"))
+WYC_CONFIRM_VOL_MULT = float(os.getenv("PPE_WYC_CONFIRM_VOL_MULT", "1.2"))    # объём на подтверждающем баре
 
 HTTP_HOST = os.getenv("PPE_HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.getenv("PPE_HTTP_PORT", "8001"))
@@ -93,7 +82,7 @@ logging.basicConfig(
 )
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "PolarisPhaseEngine/1.1"})
+SESSION.headers.update({"User-Agent": "PolarisPhaseEngine/1.3-wyc-1h"})
 
 
 # ===================== УТИЛИТЫ ===================== #
@@ -172,6 +161,17 @@ def _zscore(series: pd.Series, length: int) -> pd.Series:
     std = roll.std(ddof=0)
     std = std.replace(0, np.nan)
     return (series - mean) / std
+
+
+def _compute_cvd(df: pd.DataFrame) -> pd.Series:
+    """
+    Простейший CVD по агрессорам:
+    delta = buy - sell = taker_buy_base - (volume - taker_buy_base)
+    """
+    buy = df["taker_buy_base"]
+    sell = df["volume"] - df["taker_buy_base"]
+    delta = buy - sell
+    return delta.cumsum()
 
 
 # ===================== РАСЧЁТ ФАЗ 4H ===================== #
@@ -313,11 +313,11 @@ def compute_all_phases() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-# ===================== СИГНАЛЫ: PRE + CONF ===================== #
+# ===================== СИГНАЛЫ: PRE ===================== #
 
 
 def _compute_pre_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """PRE-сигналы по 4H-фазам PUMP/DUMP."""
+    """PRE-сигналы по 4H-фазам PUMP/DUMP. Логика как и была."""
     signals: List[Dict[str, Any]] = []
 
     for symbol, info in phases.items():
@@ -360,179 +360,259 @@ def _compute_pre_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, An
     return signals
 
 
-def _try_confirm_long(
-    symbol: str,
-    info: Dict[str, Any],
-    df_1h: pd.DataFrame,
-    vol_med: float,
-) -> Dict[str, Any] | None:
-    """Попытка найти CONF LONG по 1H на основе PRE LONG на 4H."""
-    if len(df_1h) < 10:
+# ===================== Wyckoff CONF на 1h (TR + Spring / UT) ===================== #
+
+
+def _find_wyckoff_confirm_long(
+    df: pd.DataFrame,
+    pre_ts: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Wyckoff CONF LONG на младшем ТФ:
+    - TR (диапазон) в последние WYC_TR_BARS баров
+    - внутри TR есть спринг (вынос вниз + возврат)
+    - последняя свеча – бычья, с объёмом, закрывается в верхней части TR
+    """
+    if len(df) < WYC_MIN_TR_BARS + 2:
         return None
 
-    df = df_1h.copy()
-    df["ema_fast"] = _ema(df["close"], EMA_FAST)
-    df["ema_slow"] = _ema(df["close"], EMA_SLOW)
+    # берём последнее окно
+    window = min(WYC_TR_BARS + 2, len(df))
+    df_win = df.iloc[-window:].copy()
 
-    last = df.iloc[-1]
-    ema_fast_last = float(df["ema_fast"].iloc[-1])
+    # TR ядро: все кроме последнего бара (подтверждающий)
+    if len(df_win) < WYC_MIN_TR_BARS + 1:
+        return None
+    df_tr = df_win.iloc[:-1]
+    conf_row = df_win.iloc[-1]
 
-    # Подтверждающая бычья свеча
-    is_bull = last["close"] > last["open"]
-    close_above_ema = last["close"] > ema_fast_last
-    volume_ok = last["volume"] >= vol_med * CONF_CONFIRM_VOL_MIN_MULT
-
-    if not (is_bull and close_above_ema and volume_ok):
+    # диапазон TR
+    tr_low = float(df_tr["low"].min())
+    tr_high = float(df_tr["high"].max())
+    if tr_low <= 0:
+        return None
+    tr_range = tr_high - tr_low
+    tr_range_pct = tr_range / tr_low
+    if tr_range_pct > WYC_TR_MAX_RANGE_PCT:
         return None
 
-    # Ищем откатную зону в последних N барах до подтверждающего
-    lookback = min(CONF_PULLBACK_LOOKBACK, len(df) - 1)
-    start_idx = len(df) - 1 - lookback
-    pullback_indices: List[int] = []
-
-    for i in range(start_idx, len(df) - 1):
-        low_i = df["low"].iat[i]
-        ema_fast_i = df["ema_fast"].iat[i]
-        ema_slow_i = df["ema_slow"].iat[i]
-        vol_i = df["volume"].iat[i]
-
-        # зона около EMA20/EMA50
-        in_zone = (
-            low_i <= ema_fast_i * (1 + CONF_PRICE_EPS)
-            and low_i >= ema_slow_i * (1 - CONF_PRICE_EPS)
-        )
-        vol_ok = vol_i <= vol_med * CONF_PULLBACK_VOL_MAX_MULT
-
-        if in_zone and vol_ok:
-            pullback_indices.append(i)
-
-    if not pullback_indices:
+    # объём
+    vol_med = float(df_tr["volume"].median())
+    if not np.isfinite(vol_med) or vol_med <= 0:
+        vol_med = float(df_win["volume"].median())
+    if vol_med <= 0:
         return None
 
-    pullback_low = float(min(df["low"].iat[i] for i in pullback_indices))
-    pullback_high = float(max(df["high"].iat[i] for i in pullback_indices))
+    # ищем последний спринг в TR
+    spring_idx: Optional[int] = None
+    for i in range(len(df_tr) - 1, -1, -1):
+        row = df_tr.iloc[i]
+        hi = float(row["high"])
+        lo = float(row["low"])
+        cl = float(row["close"])
+        spread = hi - lo
+        if spread <= 0:
+            continue
 
-    # подтверждающая свеча должна закрыться выше максимума отката
-    if last["close"] <= pullback_high:
+        # выход ниже TR-низа
+        if lo > tr_low * (1 - WYC_SPRING_BREAK_PCT):
+            continue
+        # закрытие обратно в диапазон
+        if cl <= tr_low:
+            continue
+        # длинная нижняя тень
+        if (cl - lo) / spread < WYC_SPRING_WICK_RATIO:
+            continue
+        # объём на спринг-баре
+        if float(row["volume"]) < vol_med * WYC_SPRING_VOL_MULT:
+            continue
+
+        spring_idx = df_tr.index[i]
+        break
+
+    if spring_idx is None:
         return None
 
-    # не запрыгиваем слишком высоко относительно хай 4H-бара PRE
-    high4h = info.get("high4h")
-    if high4h is not None:
-        try:
-            high4h_f = float(high4h)
-            if last["close"] > high4h_f * (1 + CONF_MAX_BREAKOUT_4H):
-                return None
-        except Exception:
-            pass
+    spring_row = df.loc[spring_idx]
 
-    last_close_time: datetime = df["close_time"].iloc[-1]
-    pre_ts = int(info.get("timestamp") or 0)
+    # подтверждающая свеча (последний бар окна)
+    hi_c = float(conf_row["high"])
+    lo_c = float(conf_row["low"])
+    op_c = float(conf_row["open"])
+    cl_c = float(conf_row["close"])
+    spread_c = hi_c - lo_c
+    vol_c = float(conf_row["volume"])
+
+    if spread_c <= 0:
+        return None
+
+    # бычья свеча
+    if cl_c <= op_c:
+        return None
+
+    # закрытие в верхней части диапазона
+    tr_mid = tr_low + tr_range * 0.5
+    if cl_c <= tr_mid:
+        return None
+
+    # желательно выше хая спринга
+    if cl_c <= float(spring_row["high"]):
+        return None
+
+    # объём выше медианы
+    if vol_c < vol_med * WYC_CONFIRM_VOL_MULT:
+        return None
+
+    # возраст относительно PRE
+    conf_time: datetime = conf_row["close_time"]
+    conf_ts = int(conf_time.timestamp())
+    age_hours = (conf_ts - float(pre_ts)) / 3600.0
+    if age_hours < 0 or age_hours > CONF_MAX_AGE_HOURS:
+        return None
+
+    # CVD по окну
+    cvd = _compute_cvd(df_win)
+    try:
+        cvd_delta = float(cvd.iloc[-1] - cvd.iloc[0])
+    except Exception:
+        cvd_delta = 0.0
 
     return {
-        "symbol": symbol,
-        "side": "LONG",
-        "kind": "CONF",
-        "phase": info.get("phase"),
-        "interval": info.get("interval"),  # 4h-контекст
-        "triggerInterval": CONF_INTERVAL,  # 1h-триггер
-        "barsInPhase": int(info.get("pumpCount") or 0),
-        "trendDir": int(info.get("trendDir") or 0),
-        "generatedAt": int(last_close_time.timestamp()),
-        "entryClose": float(last["close"]),
-        "pullbackLow": pullback_low,
-        "pullbackHigh": pullback_high,
-        "preTimestamp": pre_ts,
+        "entryClose": cl_c,
+        "rangeLow": tr_low,
+        "rangeHigh": tr_high,
+        "springLow": float(spring_row["low"]),
+        "springTime": int(spring_row["close_time"].timestamp()),
+        "confirmTime": conf_ts,
+        "cvdDelta": cvd_delta,
     }
 
 
-def _try_confirm_short(
-    symbol: str,
-    info: Dict[str, Any],
-    df_1h: pd.DataFrame,
-    vol_med: float,
-) -> Dict[str, Any] | None:
-    """Попытка найти CONF SHORT по 1H на основе PRE SHORT на 4H."""
-    if len(df_1h) < 10:
+def _find_wyckoff_confirm_short(
+    df: pd.DataFrame,
+    pre_ts: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Wyckoff CONF SHORT на младшем ТФ:
+    - TR в последние WYC_TR_BARS баров
+    - внутри TR есть upthrust (вынос вверх + возврат)
+    - последняя свеча – медвежья, с объёмом, закрывается в нижней части TR
+    """
+    if len(df) < WYC_MIN_TR_BARS + 2:
         return None
 
-    df = df_1h.copy()
-    df["ema_fast"] = _ema(df["close"], EMA_FAST)
-    df["ema_slow"] = _ema(df["close"], EMA_SLOW)
+    window = min(WYC_TR_BARS + 2, len(df))
+    df_win = df.iloc[-window:].copy()
 
-    last = df.iloc[-1]
-    ema_fast_last = float(df["ema_fast"].iloc[-1])
+    if len(df_win) < WYC_MIN_TR_BARS + 1:
+        return None
+    df_tr = df_win.iloc[:-1]
+    conf_row = df_win.iloc[-1]
 
-    # Подтверждающая медвежья свеча
-    is_bear = last["close"] < last["open"]
-    close_below_ema = last["close"] < ema_fast_last
-    volume_ok = last["volume"] >= vol_med * CONF_CONFIRM_VOL_MIN_MULT
-
-    if not (is_bear and close_below_ema and volume_ok):
+    tr_low = float(df_tr["low"].min())
+    tr_high = float(df_tr["high"].max())
+    if tr_low <= 0:
+        return None
+    tr_range = tr_high - tr_low
+    tr_range_pct = tr_range / tr_low
+    if tr_range_pct > WYC_TR_MAX_RANGE_PCT:
         return None
 
-    # Ищем откат вверх в зону EMA20/EMA50
-    lookback = min(CONF_PULLBACK_LOOKBACK, len(df) - 1)
-    start_idx = len(df) - 1 - lookback
-    pullback_indices: List[int] = []
-
-    for i in range(start_idx, len(df) - 1):
-        high_i = df["high"].iat[i]
-        ema_fast_i = df["ema_fast"].iat[i]
-        ema_slow_i = df["ema_slow"].iat[i]
-        vol_i = df["volume"].iat[i]
-
-        in_zone = (
-            high_i >= ema_fast_i * (1 - CONF_PRICE_EPS)
-            and high_i <= ema_slow_i * (1 + CONF_PRICE_EPS)
-        )
-        vol_ok = vol_i <= vol_med * CONF_PULLBACK_VOL_MAX_MULT
-
-        if in_zone and vol_ok:
-            pullback_indices.append(i)
-
-    if not pullback_indices:
+    vol_med = float(df_tr["volume"].median())
+    if not np.isfinite(vol_med) or vol_med <= 0:
+        vol_med = float(df_win["volume"].median())
+    if vol_med <= 0:
         return None
 
-    pullback_low = float(min(df["low"].iat[i] for i in pullback_indices))
-    pullback_high = float(max(df["high"].iat[i] for i in pullback_indices))
+    # ищем последний upthrust в TR
+    ut_idx: Optional[int] = None
+    for i in range(len(df_tr) - 1, -1, -1):
+        row = df_tr.iloc[i]
+        hi = float(row["high"])
+        lo = float(row["low"])
+        cl = float(row["close"])
+        spread = hi - lo
+        if spread <= 0:
+            continue
 
-    # подтверждающая свеча должна закрыться ниже минимума отката
-    if last["close"] >= pullback_low:
+        # выход выше TR-верха
+        if hi < tr_high * (1 + WYC_UT_BREAK_PCT):
+            continue
+        # закрытие обратно в диапазон
+        if cl >= tr_high:
+            continue
+        # длинная верхняя тень
+        if (hi - cl) / spread < WYC_UT_WICK_RATIO:
+            continue
+        # объём на UT-баре
+        if float(row["volume"]) < vol_med * WYC_UT_VOL_MULT:
+            continue
+
+        ut_idx = df_tr.index[i]
+        break
+
+    if ut_idx is None:
         return None
 
-    # не шортим в самой дыре относительно лоу 4H-бара PRE
-    low4h = info.get("low4h")
-    if low4h is not None:
-        try:
-            low4h_f = float(low4h)
-            if last["close"] < low4h_f * (1 - CONF_MAX_BREAKOUT_4H):
-                return None
-        except Exception:
-            pass
+    ut_row = df.loc[ut_idx]
 
-    last_close_time: datetime = df["close_time"].iloc[-1]
-    pre_ts = int(info.get("timestamp") or 0)
+    # подтверждающая свеча (последний бар окна)
+    hi_c = float(conf_row["high"])
+    lo_c = float(conf_row["low"])
+    op_c = float(conf_row["open"])
+    cl_c = float(conf_row["close"])
+    spread_c = hi_c - lo_c
+    vol_c = float(conf_row["volume"])
+
+    if spread_c <= 0:
+        return None
+
+    # медвежья свеча
+    if cl_c >= op_c:
+        return None
+
+    # закрытие в нижней части диапазона
+    tr_mid = tr_low + tr_range * 0.5
+    if cl_c >= tr_mid:
+        return None
+
+    # желательно ниже low UT-бара
+    if cl_c >= float(ut_row["low"]):
+        return None
+
+    # объём выше медианы
+    if vol_c < vol_med * WYC_CONFIRM_VOL_MULT:
+        return None
+
+    # возраст относительно PRE
+    conf_time: datetime = conf_row["close_time"]
+    conf_ts = int(conf_time.timestamp())
+    age_hours = (conf_ts - float(pre_ts)) / 3600.0
+    if age_hours < 0 or age_hours > CONF_MAX_AGE_HOURS:
+        return None
+
+    # CVD по окну
+    cvd = _compute_cvd(df_win)
+    try:
+        cvd_delta = float(cvd.iloc[-1] - cvd.iloc[0])
+    except Exception:
+        cvd_delta = 0.0
 
     return {
-        "symbol": symbol,
-        "side": "SHORT",
-        "kind": "CONF",
-        "phase": info.get("phase"),
-        "interval": info.get("interval"),  # 4h-контекст
-        "triggerInterval": CONF_INTERVAL,  # 1h-триггер
-        "barsInPhase": int(info.get("dumpCount") or 0),
-        "trendDir": int(info.get("trendDir") or 0),
-        "generatedAt": int(last_close_time.timestamp()),
-        "entryClose": float(last["close"]),
-        "pullbackLow": pullback_low,
-        "pullbackHigh": pullback_high,
-        "preTimestamp": pre_ts,
+        "entryClose": cl_c,
+        "rangeLow": tr_low,
+        "rangeHigh": tr_high,
+        "upthrustHigh": float(ut_row["high"]),
+        "upthrustTime": int(ut_row["close_time"].timestamp()),
+        "confirmTime": conf_ts,
+        "cvdDelta": cvd_delta,
     }
 
 
-def _compute_confirm_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """CONF-сигналы по 1H на основе PRE-контекста 4H."""
+def _compute_confirm_signals_wyckoff(
+    phases: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """CONF-сигналы Wyckoff на младшем ТФ (TR + спринг/UT) в контексте 4h PRE."""
     if not CONF_ENABLED:
         return []
 
@@ -546,7 +626,6 @@ def _compute_confirm_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str
 
         phase = info.get("phase")
         trend_dir = int(info.get("trendDir") or 0)
-        regime = info.get("regime")
         pump_count = int(info.get("pumpCount") or 0)
         dump_count = int(info.get("dumpCount") or 0)
         pre_ts = info.get("timestamp")
@@ -554,30 +633,27 @@ def _compute_confirm_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str
         if pre_ts is None:
             continue
 
-        # Проверяем, что PRE вообще имеет смысл
+        # контекст PRE
         is_long_ctx = (
             phase == "PUMP"
             and trend_dir > 0
             and pump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL
-            and pump_count <= CONF_MAX_PHASE_BARS
         )
 
         is_short_ctx = (
             phase == "DUMP"
             and trend_dir < 0
             and dump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL
-            and dump_count <= CONF_MAX_PHASE_BARS
         )
 
         if not (is_long_ctx or is_short_ctx):
             continue
 
-        # Можно дополнительно фильтровать по regime, но PUMP/DUMP уже достаточно
         try:
             df_1h = _binance_klines(symbol, CONF_INTERVAL, CONF_KLINES_LIMIT)
         except Exception as exc:
             logger.exception(
-                "Failed to load %s %s klines for CONF: %s",
+                "Failed to load %s %s klines for Wyckoff CONF: %s",
                 symbol,
                 CONF_INTERVAL,
                 exc,
@@ -587,39 +663,64 @@ def _compute_confirm_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str
         if df_1h.empty:
             continue
 
-        last_close_time: datetime = df_1h["close_time"].iloc[-1]
-        age_hours = (last_close_time.timestamp() - float(pre_ts)) / 3600.0
-        if age_hours < 0:
-            age_hours = 0.0
-
-        if age_hours > CONF_MAX_AGE_HOURS:
-            # PRE слишком старый для CONF
-            continue
-
-        vol_med = float(df_1h["volume"].tail(50).median())
-        if not np.isfinite(vol_med) or vol_med <= 0:
-            vol_med = float(df_1h["volume"].median())
-        if vol_med <= 0:
-            continue
-
         if is_long_ctx:
-            conf = _try_confirm_long(symbol, info, df_1h, vol_med)
+            conf = _find_wyckoff_confirm_long(df_1h, int(pre_ts))
             if conf is not None:
-                signals.append(conf)
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "side": "LONG",
+                        "kind": "CONF",
+                        "confirmType": "WYC_TR_SPRING",
+                        "phase": phase,
+                        "interval": info.get("interval"),  # 4h-контекст
+                        "triggerInterval": CONF_INTERVAL,   # 1h-триггер
+                        "barsInPhase": pump_count,
+                        "trendDir": trend_dir,
+                        "generatedAt": conf["confirmTime"],
+                        "entryClose": conf["entryClose"],
+                        "rangeLow": conf["rangeLow"],
+                        "rangeHigh": conf["rangeHigh"],
+                        "springLow": conf["springLow"],
+                        "springTime": conf["springTime"],
+                        "preTimestamp": int(pre_ts),
+                        "cvdDelta": conf["cvdDelta"],
+                    }
+                )
 
         if is_short_ctx:
-            conf = _try_confirm_short(symbol, info, df_1h, vol_med)
+            conf = _find_wyckoff_confirm_short(df_1h, int(pre_ts))
             if conf is not None:
-                signals.append(conf)
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "side": "SHORT",
+                        "kind": "CONF",
+                        "confirmType": "WYC_TR_UT",
+                        "phase": phase,
+                        "interval": info.get("interval"),  # 4h-контекст
+                        "triggerInterval": CONF_INTERVAL,   # 1h-триггер
+                        "barsInPhase": dump_count,
+                        "trendDir": trend_dir,
+                        "generatedAt": conf["confirmTime"],
+                        "entryClose": conf["entryClose"],
+                        "rangeLow": conf["rangeLow"],
+                        "rangeHigh": conf["rangeHigh"],
+                        "upthrustHigh": conf["upthrustHigh"],
+                        "upthrustTime": conf["upthrustTime"],
+                        "preTimestamp": int(pre_ts),
+                        "cvdDelta": conf["cvdDelta"],
+                    }
+                )
 
     return signals
 
 
 def compute_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Общий генератор сигналов: PRE + CONF."""
+    """PRE (4h PUMP/DUMP) + Wyckoff CONF (1h TR + спринг/UT)."""
     pre = _compute_pre_signals(phases)
-    conf = _compute_confirm_signals(phases)
-    return pre + conf
+    wyc_conf = _compute_confirm_signals_wyckoff(phases)
+    return pre + wyc_conf
 
 
 # ===================== FLASK HTTP ===================== #
