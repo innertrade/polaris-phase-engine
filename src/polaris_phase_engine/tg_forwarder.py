@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import hashlib
+import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from urllib.parse import quote_plus
 
 load_dotenv()
-
-PPE_TG_BOT_TOKEN = os.getenv("PPE_TG_BOT_TOKEN")
-PPE_TG_CHAT_ID = os.getenv("PPE_TG_CHAT_ID")
-PPE_TG_POLL_INTERVAL = int(os.getenv("PPE_TG_POLL_INTERVAL", "60"))
-PPE_TG_SIGNALS_URL = os.getenv("PPE_TG_SIGNALS_URL", "http://127.0.0.1:8001/signals")
-
-if not PPE_TG_BOT_TOKEN:
-    raise RuntimeError("PPE_TG_BOT_TOKEN is not set")
-if not PPE_TG_CHAT_ID:
-    raise RuntimeError("PPE_TG_CHAT_ID is not set")
-
-TG_SEND_URL = f"https://api.telegram.org/bot{PPE_TG_BOT_TOKEN}/sendMessage"
 
 logger = logging.getLogger("polaris-tg-forwarder")
 logging.basicConfig(
@@ -30,218 +18,214 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-session = requests.Session()
-session.headers.update({"User-Agent": "PolarisTGForwarder/wyc-1"})
+TG_BOT_TOKEN = os.getenv("PPE_TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("PPE_TG_CHAT_ID", "").strip()
+POLL_INTERVAL = int(os.getenv("PPE_TG_POLL_INTERVAL", "60"))
+SIGNALS_URL = os.getenv("PPE_TG_SIGNALS_URL", "http://127.0.0.1:8001/signals").strip()
+
+# Шаблон ссылки на TV (подгони под свой формат символов, если надо)
+# Пример по умолчанию: BINANCE:BTCUSDT (спот). Для перпа можно поменять на BINANCE:{symbol}.P
+TV_LINK_TEMPLATE = os.getenv(
+    "PPE_TG_TV_LINK_TEMPLATE",
+    "https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+).strip()
+
+STATE_PATH = os.getenv("PPE_TG_STATE_PATH", "/opt/polaris-phase-engine/.tg_forwarder_state.json").strip()
+STATE_MAX = int(os.getenv("PPE_TG_STATE_MAX", "5000"))
+STATE_TTL_SEC = int(os.getenv("PPE_TG_STATE_TTL_SEC", str(7 * 24 * 3600)))  # 7 дней
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.0"})
 
 
-# ----- helpers --------------------------------------------------------------
-
-
-def _trend_str(trend_dir: Any) -> str:
+def _tv_link(symbol: str) -> str:
     try:
-        d = int(trend_dir)
+        return TV_LINK_TEMPLATE.format(symbol=symbol)
     except Exception:
-        return "нет данных"
-    if d > 0:
-        return "UP ↑"
-    if d < 0:
-        return "DOWN ↓"
-    return "FLAT →"
+        return TV_LINK_TEMPLATE
 
 
-def _tv_link(symbol: str, exchange: str = "BINANCE") -> str:
-    sym = f"{exchange}:{symbol.upper()}"
-    return f"https://www.tradingview.com/chart/?symbol={quote_plus(sym)}"
+def _ts_to_str(ts: Optional[int]) -> str:
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return ""
 
 
-def _make_signal_id(sig: Dict[str, Any]) -> str:
-    """
-    Уникальный id сигнала, чтобы не слать дубли.
-    Привязан к символу, типу, стороне и времени генерации.
-    """
-    parts = [
-        str(sig.get("symbol", "")),
-        str(sig.get("kind", "")),
-        str(sig.get("side", "")),
-        str(sig.get("phase", "")),
-        str(sig.get("confirmType", "")),
-        str(sig.get("generatedAt", "")),
-    ]
-    key = "|".join(parts)
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+def _load_state() -> Dict[str, int]:
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return {str(k): int(v) for k, v in raw.items()}
+    except Exception:
+        pass
+    return {}
 
 
-# ----- formatting -----------------------------------------------------------
+def _save_state(state: Dict[str, int]) -> None:
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Failed to save state: %s", e)
+
+
+def _prune_state(state: Dict[str, int]) -> Dict[str, int]:
+    now = int(time.time())
+    state = {k: v for k, v in state.items() if (now - int(v)) <= STATE_TTL_SEC}
+    if len(state) > STATE_MAX:
+        # оставляем самые новые
+        items = sorted(state.items(), key=lambda kv: kv[1], reverse=True)[:STATE_MAX]
+        state = dict(items)
+    return state
+
+
+def _make_uid(sig: Dict[str, Any]) -> str:
+    kind = str(sig.get("kind", "")).upper()
+    symbol = str(sig.get("symbol", "")).upper()
+    side = str(sig.get("side", "")).upper()
+    ctype = str(sig.get("confirmType", "")).upper()
+    ts = sig.get("generatedAt") or sig.get("timestamp") or ""
+    return f"{kind}|{ctype}|{symbol}|{side}|{ts}"
 
 
 def _format_pre(sig: Dict[str, Any]) -> str:
-    """
-    Сообщение для PRE-сигнала (4h PUMP/DUMP).
-    """
-    symbol = sig.get("symbol", "?")
-    side = sig.get("side", "").upper()  # LONG / SHORT
-    phase = sig.get("phase", "?")
+    symbol = sig.get("symbol", "")
+    side = sig.get("side", "")
+    phase = sig.get("phase", "")
     interval = sig.get("interval", "4h")
-    bars = sig.get("barsInPhase", "?")
-    trend = _trend_str(sig.get("trendDir"))
+    bars = sig.get("barsInPhase", "")
+    trend = sig.get("trendDir", "")
+    t = _ts_to_str(sig.get("generatedAt"))
+    link = _tv_link(symbol)
 
-    if side == "LONG":
-        emoji = "🚀"
-    elif side == "SHORT":
-        emoji = "🛑"
-    else:
-        emoji = "⚠️"
+    trend_txt = "UP ↑" if int(trend or 0) > 0 else ("DOWN ↓" if int(trend or 0) < 0 else "FLAT →")
 
-    tv = _tv_link(symbol)
-
-    text = (
-        f"{emoji} [PRE {side}] {symbol} {interval} {phase}\n\n"
-        f"Фаза {interval}: {phase} (баров в фазе: {bars}, тренд: {trend})\n\n"
-        f"TV: {tv}"
-    )
-    return text
+    lines = [
+        f"🟡 *PRE {side}*  `{symbol}`",
+        f"_ctx_: {interval} {phase} | bars: {bars} | trend: {trend_txt}",
+    ]
+    if t:
+        lines.append(f"_time_: {t}")
+    lines.append(f"🔗 TV: {link}")
+    return "\n".join(lines)
 
 
 def _format_conf(sig: Dict[str, Any]) -> str:
-    """
-    Сообщение для CONF Wyckoff:
-    LONG: confirmType = WYC_TR_SPRING
-    SHORT: confirmType = WYC_TR_UT
-    """
-    symbol = sig.get("symbol", "?")
-    side = sig.get("side", "").upper()  # LONG / SHORT
-    phase = sig.get("phase", "?")
-    interval = sig.get("interval", "4h")          # базовый ТФ фаз
-    trigger_interval = sig.get("triggerInterval", "1h")  # ТФ триггера (1h)
-    bars = sig.get("barsInPhase", "?")
-    trend = _trend_str(sig.get("trendDir"))
-    confirm_type = sig.get("confirmType", "")
+    symbol = sig.get("symbol", "")
+    side = sig.get("side", "")
+    ctype = sig.get("confirmType", "CONF")
+    phase = sig.get("phase", "")
+    interval = sig.get("interval", "4h")
+    trig = sig.get("triggerInterval", "1h")
+    bars = sig.get("barsInPhase", "")
+    t = _ts_to_str(sig.get("generatedAt"))
+    link = _tv_link(symbol)
 
-    range_low = sig.get("rangeLow")
-    range_high = sig.get("rangeHigh")
-    entry_close = sig.get("entryClose")
+    oi = sig.get("oiChangePct", None)
+    dr = sig.get("deltaRatio", None)
+    pc = sig.get("priceChangePct", None)
+    lb = sig.get("lookbackBars", "")
 
-    cvd_delta = sig.get("cvdDelta")
-    cvd_str = ""
-    if cvd_delta is not None:
+    def pct(x: Any) -> str:
         try:
-            cvd_val = float(cvd_delta)
-            cvd_str = f"{cvd_val:+.0f}"
+            return f"{float(x)*100:.2f}%"
         except Exception:
-            cvd_str = "n/a"
+            return "n/a"
 
-    if side == "LONG":
-        emoji = "✅"
-        label = "WYC SPRING"
-        spring_low = sig.get("springLow")
-        extra_line = f"Spring: {spring_low:.6f}" if isinstance(spring_low, (float, int)) else "Spring: n/a"
-    else:
-        emoji = "⛔️"
-        label = "WYC UT"
-        ut_high = sig.get("upthrustHigh")
-        extra_line = f"Upthrust: {ut_high:.6f}" if isinstance(ut_high, (float, int)) else "Upthrust: n/a"
+    def num(x: Any) -> str:
+        try:
+            return f"{float(x):.3f}"
+        except Exception:
+            return "n/a"
 
-    tv = _tv_link(symbol)
-
-    # TR строка
-    if isinstance(range_low, (float, int)) and isinstance(range_high, (float, int)):
-        tr_line = f"TR {trigger_interval}: {range_low:.6f}–{range_high:.6f}"
-    else:
-        tr_line = f"TR {trigger_interval}: n/a"
-
-    # entry строка
-    if isinstance(entry_close, (float, int)):
-        entry_line = f"Вход (close {trigger_interval}): {entry_close:.6f}"
-    else:
-        entry_line = f"Вход (close {trigger_interval}): n/a"
-
-    # CVD строка
-    if cvd_str:
-        cvd_line = f"CVD Δ (окно TR): {cvd_str}"
-    else:
-        cvd_line = "CVD Δ (окно TR): n/a"
-
-    text = (
-        f"{emoji} [CONF {side} • {label}] {symbol} {interval}→{trigger_interval}\n\n"
-        f"Фаза {interval}: {phase} (баров в фазе: {bars}, тренд: {trend})\n"
-        f"{tr_line}\n"
-        f"{extra_line}\n"
-        f"{entry_line}\n"
-        f"{cvd_line}\n\n"
-        f"TV: {tv}"
-    )
-    return text
+    lines = [
+        f"✅ *CONF {ctype}*  `{symbol}`  → *{side}*",
+        f"_ctx_: {interval} {phase} | bars: {bars} | _tf_: {trig} | lb: {lb}",
+        f"OI: {pct(oi)} | Δ: {num(dr)} | Price: {pct(pc)}",
+    ]
+    if t:
+        lines.append(f"_time_: {t}")
+    lines.append(f"🔗 TV: {link}")
+    return "\n".join(lines)
 
 
-def _format_signal(sig: Dict[str, Any]) -> Optional[str]:
-    kind = sig.get("kind")
+def _format_message(sig: Dict[str, Any]) -> str:
+    kind = str(sig.get("kind", "")).upper()
     if kind == "PRE":
         return _format_pre(sig)
     if kind == "CONF":
-        # сейчас у нас только Wyckoff-CONF
         return _format_conf(sig)
-    # на всякий пожарный — неизвестный тип не шлём
-    return None
+    # fallback
+    return f"ℹ️ `{sig}`"
 
 
-# ----- telegram -------------------------------------------------------------
+def _fetch_signals() -> List[Dict[str, Any]]:
+    r = SESSION.get(SIGNALS_URL, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    sigs = data.get("signals", [])
+    if isinstance(sigs, list):
+        return [s for s in sigs if isinstance(s, dict)]
+    return []
 
 
-def _send_telegram(text: str) -> None:
-    try:
-        resp = session.post(
-            TG_SEND_URL,
-            json={
-                "chat_id": PPE_TG_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",  # вдруг захотим стили в будущем
-                "disable_web_page_preview": False,
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        logger.info("Sent Telegram message (%d bytes)", len(text))
-    except Exception as exc:
-        logger.error("Failed to send Telegram message: %s", exc)
+def _send_to_telegram(text: str) -> None:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        raise RuntimeError("PPE_TG_BOT_TOKEN or PPE_TG_CHAT_ID is not set")
 
-
-# ----- main loop ------------------------------------------------------------
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    r = SESSION.post(url, json=payload, timeout=10)
+    r.raise_for_status()
 
 
 def main() -> None:
-    logger.info(
-        "Starting Telegram forwarder: signals_url=%s chat_id=%s interval=%ss",
-        PPE_TG_SIGNALS_URL,
-        PPE_TG_CHAT_ID,
-        PPE_TG_POLL_INTERVAL,
-    )
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        logger.error("PPE_TG_BOT_TOKEN is not set or PPE_TG_CHAT_ID is not set")
+        return
 
-    sent: set[str] = set()
+    logger.info("Starting TG forwarder: url=%s chat_id=%s interval=%ss", SIGNALS_URL, TG_CHAT_ID, POLL_INTERVAL)
+
+    state = _prune_state(_load_state())
 
     while True:
         try:
-            resp = session.get(PPE_TG_SIGNALS_URL, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            signals: List[Dict[str, Any]] = data.get("signals", [])
-        except Exception as exc:
-            logger.error("Failed to fetch signals: %s", exc)
-            time.sleep(PPE_TG_POLL_INTERVAL)
-            continue
+            sigs = _fetch_signals()
+            logger.info("Fetched %d signals", len(sigs))
 
-        for sig in signals:
-            sig_id = _make_signal_id(sig)
-            if sig_id in sent:
-                continue
+            sent_any = False
+            now = int(time.time())
 
-            text = _format_signal(sig)
-            if not text:
-                continue
+            for sig in sigs:
+                uid = _make_uid(sig)
+                if uid in state:
+                    continue
 
-            _send_telegram(text)
-            sent.add(sig_id)
+                msg = _format_message(sig)
+                _send_to_telegram(msg)
 
-        time.sleep(PPE_TG_POLL_INTERVAL)
+                state[uid] = now
+                sent_any = True
+                logger.info("Sent message to Telegram")
+
+            if sent_any:
+                state = _prune_state(state)
+                _save_state(state)
+
+        except Exception as e:
+            logger.error("Failed cycle: %s", e)
+
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
