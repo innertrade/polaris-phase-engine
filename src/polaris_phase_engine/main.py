@@ -5,8 +5,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -27,7 +26,7 @@ SYMBOLS: List[str] = [s.strip().upper() for s in _raw_symbols.split(",") if s.st
 INTERVAL = os.getenv("PPE_INTERVAL", "4h")
 KLINES_LIMIT = int(os.getenv("PPE_KLINES_LIMIT", "500"))
 
-# Phase params (sync with PolarisPhaseMVP)
+# Phase params
 EMA_FAST = int(os.getenv("PPE_EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("PPE_EMA_SLOW", "50"))
 TREND_UP_THR = float(os.getenv("PPE_TREND_UP_THR", "0.0015"))
@@ -44,8 +43,7 @@ VOL_HOT = float(os.getenv("PPE_VOL_HOT", "0.5"))
 
 MIN_BARS_IN_PHASE_FOR_SIGNAL = int(os.getenv("PPE_MIN_BARS_IN_PHASE_FOR_SIGNAL", "2"))
 
-# ---- CONF v2 (CVD + OI + Price) on confirm TF (default 1h) ----
-
+# ---- CONF v2 (CVD + OI + Price) ----
 CONF_ENABLED = os.getenv("PPE_CONFIRM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 CONF_INTERVAL = os.getenv("PPE_CONFIRM_INTERVAL", "1h")
 CONF_KLINES_LIMIT = int(os.getenv("PPE_CONFIRM_KLINES_LIMIT", "200"))
@@ -54,14 +52,13 @@ CONF_KLINES_LIMIT = int(os.getenv("PPE_CONFIRM_KLINES_LIMIT", "200"))
 CONF_WINDOW_BARS = int(os.getenv("PPE_CONF_WINDOW_BARS", "12"))
 
 # price thresholds
-CONF_PRICE_FLAT_PCT = float(os.getenv("PPE_CONF_PRICE_FLAT_PCT", "0.003"))   # 0.3% ~ "flat"
-CONF_PRICE_MOVE_PCT = float(os.getenv("PPE_CONF_PRICE_MOVE_PCT", "0.007"))   # 0.7% ~ "move"
+CONF_PRICE_FLAT_PCT = float(os.getenv("PPE_CONF_PRICE_FLAT_PCT", "0.003"))  # 0.3% ~ "flat"
+CONF_PRICE_MOVE_PCT = float(os.getenv("PPE_CONF_PRICE_MOVE_PCT", "0.007"))  # 0.7% ~ "move"
 
-# delta ratio threshold (CVD change / total volume)
+# delta ratio threshold (delta_sum / total_volume)
 CONF_DELTA_RATIO_THR = float(os.getenv("PPE_CONF_DELTA_RATIO_THR", "0.15"))
 
 # open interest settings
-# Binance returns both sumOpenInterest (contracts) and sumOpenInterestValue (USD-ish)
 CONF_OI_VALUE_MODE = os.getenv("PPE_CONF_OI_VALUE_MODE", "value").strip().lower()  # "value" or "contracts"
 CONF_OI_MOVE_PCT = float(os.getenv("PPE_CONF_OI_MOVE_PCT", "0.01"))  # 1% minimal OI rise
 
@@ -82,7 +79,7 @@ logging.basicConfig(
 )
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "PolarisPhaseEngine/2.0-confv2-cache"})
+SESSION.headers.update({"User-Agent": "PolarisPhaseEngine/2.1-confv2-cache"})
 
 # ===================== BINANCE HELPERS ===================== #
 
@@ -90,7 +87,7 @@ SESSION.headers.update({"User-Agent": "PolarisPhaseEngine/2.0-confv2-cache"})
 def _binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     """Load klines from Binance Futures (USDT-M)."""
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    params = {"symbol": symbol, "interval": interval, "limit": int(limit)}
     resp = SESSION.get(url, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
@@ -129,6 +126,7 @@ def _binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
 
+    df = df.sort_values("close_time").reset_index(drop=True)
     return df
 
 
@@ -138,7 +136,7 @@ def _binance_open_interest_hist(symbol: str, period: str, limit: int) -> pd.Data
     GET /futures/data/openInterestHist?symbol=...&period=...&limit=...
     """
     url = f"{BINANCE_FAPI}/futures/data/openInterestHist"
-    params = {"symbol": symbol, "period": period, "limit": limit}
+    params = {"symbol": symbol, "period": period, "limit": int(limit)}
     resp = SESSION.get(url, params=params, timeout=20)
     resp.raise_for_status()
     data = resp.json()
@@ -146,12 +144,10 @@ def _binance_open_interest_hist(symbol: str, period: str, limit: int) -> pd.Data
         raise RuntimeError(f"No openInterestHist for {symbol} period={period}")
 
     df = pd.DataFrame(data)
-    # expected fields: "sumOpenInterest", "sumOpenInterestValue", "timestamp"
     if "timestamp" not in df.columns:
         raise RuntimeError(f"Bad openInterestHist payload for {symbol}")
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-
     for c in ("sumOpenInterest", "sumOpenInterestValue"):
         if c in df.columns:
             df[c] = df[c].astype(float)
@@ -192,38 +188,29 @@ def _zscore(series: pd.Series, length: int) -> pd.Series:
     return (series - mean) / std
 
 
-def _compute_cvd(df: pd.DataFrame) -> pd.Series:
-    """
-    Simple CVD by aggressors:
-    delta = buy - sell = taker_buy_base - (volume - taker_buy_base)
-    """
-    buy = df["taker_buy_base"]
-    sell = df["volume"] - df["taker_buy_base"]
-    delta = buy - sell
-    return delta.cumsum()
-
-
 def _delta_ratio(df_win: pd.DataFrame) -> float:
     """
-    delta_ratio = (CVD_end - CVD_start) / total_volume
-    in [-1..1] roughly (if taker volumes align).
+    delta_ratio = sum(delta) / sum(volume), where delta ≈ (buy - sell) by aggressor:
+      buy  = taker_buy_base
+      sell = volume - taker_buy_base
+      delta = buy - sell = 2*taker_buy_base - volume
+    Roughly in [-1..1].
     """
-    if df_win.empty:
+    if df_win is None or df_win.empty:
         return 0.0
     total_vol = float(df_win["volume"].sum())
     if not np.isfinite(total_vol) or total_vol <= 0:
         return 0.0
-    cvd = _compute_cvd(df_win)
-    d = float(cvd.iloc[-1] - cvd.iloc[0])
-    return d / total_vol
+    delta_sum = float((2.0 * df_win["taker_buy_base"] - df_win["volume"]).sum())
+    return delta_sum / total_vol
 
 
 def _price_change_pct(df_win: pd.DataFrame) -> float:
-    if len(df_win) < 2:
+    if df_win is None or len(df_win) < 2:
         return 0.0
     p0 = float(df_win["close"].iloc[0])
     p1 = float(df_win["close"].iloc[-1])
-    if p0 <= 0:
+    if p0 <= 0 or not np.isfinite(p0) or not np.isfinite(p1):
         return 0.0
     return (p1 - p0) / p0
 
@@ -234,16 +221,28 @@ def _oi_change_pct(oi_df: pd.DataFrame) -> float:
 
     col = "sumOpenInterestValue" if CONF_OI_VALUE_MODE == "value" else "sumOpenInterest"
     if col not in oi_df.columns:
-        # fallback
         col = "sumOpenInterestValue" if "sumOpenInterestValue" in oi_df.columns else "sumOpenInterest"
-        if col not in oi_df.columns:
-            return 0.0
+    if col not in oi_df.columns:
+        return 0.0
 
     v0 = float(oi_df[col].iloc[0])
     v1 = float(oi_df[col].iloc[-1])
-    if not np.isfinite(v0) or v0 <= 0:
+    if not np.isfinite(v0) or v0 <= 0 or not np.isfinite(v1):
         return 0.0
     return (v1 - v0) / v0
+
+
+def _drop_unclosed_last_kline(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Binance часто возвращает текущую (ещё НЕ закрытую) свечу как последнюю.
+    У неё close_time в будущем. Её выкидываем.
+    """
+    if df is None or df.empty:
+        return df
+    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    if pd.Timestamp(df["close_time"].iloc[-1]).tz_convert("UTC") > now_utc:
+        df = df.iloc[:-1].copy()
+    return df
 
 
 # ===================== PHASES 4H ===================== #
@@ -433,11 +432,10 @@ def _compute_conf_signals_v2(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str
         return []
 
     signals: List[Dict[str, Any]] = []
+    w = max(3, int(CONF_WINDOW_BARS))
 
-    # ensure enough bars
-    w = max(3, CONF_WINDOW_BARS)
-    need_klines = max(CONF_KLINES_LIMIT, w + 2)
-    need_oi = w + 2
+    need_klines = max(int(CONF_KLINES_LIMIT), w + 10)
+    need_oi = w + 10
 
     for symbol, ph in phases.items():
         ctx = _conf_context(ph)
@@ -446,34 +444,30 @@ def _compute_conf_signals_v2(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str
 
         try:
             df = _binance_klines(symbol, CONF_INTERVAL, need_klines)
+            df = _drop_unclosed_last_kline(df)
         except Exception as exc:
             logger.exception("CONF v2: failed to load %s %s klines: %s", symbol, CONF_INTERVAL, exc)
             continue
 
-        if df.empty or len(df) < w + 2:
+        if df is None or df.empty or len(df) < w + 2:
             continue
 
-        # use the LAST closed window (avoid using the still-forming last candle if exchange returns it)
-        # Binance klines are closed bars; still, safer to just take last w+1 bars.
-        df_win = df.iloc[-(w + 1):].copy()
+        df_win = df.iloc[-w:].copy()
 
         pchg = _price_change_pct(df_win)
         dr = _delta_ratio(df_win)
 
-        # OI window aligned by count (not perfect time sync, but good enough for v1)
+        # OI history
         try:
             oi_df = _binance_open_interest_hist(symbol, CONF_INTERVAL, need_oi)
-            if oi_df.empty or len(oi_df) < 2:
-                oi_chg = 0.0
-            else:
-                oi_df_win = oi_df.iloc[-(w + 1):].copy() if len(oi_df) >= (w + 1) else oi_df.copy()
-                oi_chg = _oi_change_pct(oi_df_win)
+            if oi_df is None or oi_df.empty or len(oi_df) < 2:
+                continue
+            oi_df_win = oi_df.iloc[-w:].copy() if len(oi_df) >= w else oi_df.copy()
+            oi_chg = _oi_change_pct(oi_df_win)
         except Exception as exc:
-            # If OI is not available (some symbols / limits) -> skip CONF for this symbol
             logger.warning("CONF v2: OI not available for %s: %s", symbol, exc)
             continue
 
-        # Conditions
         oi_up = oi_chg >= CONF_OI_MOVE_PCT
         price_flat = abs(pchg) <= CONF_PRICE_FLAT_PCT
         price_up = pchg >= CONF_PRICE_MOVE_PCT
@@ -483,99 +477,44 @@ def _compute_conf_signals_v2(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str
 
         now_ts = int(df_win["close_time"].iloc[-1].timestamp())
 
-        # LONG context
+        def _emit(side: str, ctype: str) -> Dict[str, Any]:
+            return {
+                "symbol": symbol,
+                "side": side,
+                "kind": "CONF",
+                "confirmType": ctype,
+                "phase": ph.get("phase"),
+                "interval": ph.get("interval"),           # 4h context
+                "triggerInterval": CONF_INTERVAL,         # confirm TF
+                "barsInPhase": int(ph.get("pumpCount") or ph.get("dumpCount") or 0),
+                "trendDir": int(ph.get("trendDir") or 0),
+                "generatedAt": now_ts,
+                # чтобы TG не путался:
+                "lookbackBars": w,
+                "windowBars": w,
+                "priceChangePct": float(pchg),
+                "oiChangePct": float(oi_chg),
+                "deltaRatio": float(dr),
+                "oiMode": CONF_OI_VALUE_MODE,
+            }
+
         if ctx == "LONG":
-            # LONG-1: continuation impulse
+            # LONG-1: продолжение импульса (OI↑ + Price↑ + Delta+)
             if oi_up and price_up and delta_pos:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "LONG",
-                        "kind": "CONF",
-                        "confirmType": "LONG-1",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),           # 4h context
-                        "triggerInterval": CONF_INTERVAL,         # confirm TF
-                        "barsInPhase": int(ph.get("pumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
+                signals.append(_emit("LONG", "LONG-1"))
 
-            # LONG-2: absorption (selling pressure but price holds) -> re-accumulation before push
-            # OI up (new positions), delta negative (aggressive sells), but price flat (not falling)
+            # LONG-2: абсорбция (OI↑ + Price ~ flat + Delta-)
             if oi_up and price_flat and delta_neg:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "LONG",
-                        "kind": "CONF",
-                        "confirmType": "LONG-2",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),
-                        "triggerInterval": CONF_INTERVAL,
-                        "barsInPhase": int(ph.get("pumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
+                signals.append(_emit("LONG", "LONG-2"))
 
-        # SHORT context
         if ctx == "SHORT":
-            # SHORT-1: continuation dump
+            # SHORT-1: продолжение падения (OI↑ + Price↓ + Delta-)
             if oi_up and price_dn and delta_neg:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "SHORT",
-                        "kind": "CONF",
-                        "confirmType": "SHORT-1",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),
-                        "triggerInterval": CONF_INTERVAL,
-                        "barsInPhase": int(ph.get("dumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
+                signals.append(_emit("SHORT", "SHORT-1"))
 
-            # SHORT-2: distribution (buyers push but price can't rise) -> bearish setup
-            # OI up (new positions), delta positive (aggressive buys), but price flat (not rising)
+            # SHORT-2: распределение (OI↑ + Price ~ flat + Delta+)
             if oi_up and price_flat and delta_pos:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "SHORT",
-                        "kind": "CONF",
-                        "confirmType": "SHORT-2",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),
-                        "triggerInterval": CONF_INTERVAL,
-                        "barsInPhase": int(ph.get("dumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
+                signals.append(_emit("SHORT", "SHORT-2"))
 
     return signals
 
