@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -23,11 +24,9 @@ TG_CHAT_ID = os.getenv("PPE_TG_CHAT_ID", "").strip()
 POLL_INTERVAL = int(os.getenv("PPE_TG_POLL_INTERVAL", "60"))
 SIGNALS_URL = os.getenv("PPE_TG_SIGNALS_URL", "http://127.0.0.1:8001/signals").strip()
 
-# Шаблон ссылки на TV (подгони под свой формат символов, если надо)
-# Пример по умолчанию: BINANCE:BTCUSDT (спот). Для перпа можно поменять на BINANCE:{symbol}.P
 TV_LINK_TEMPLATE = os.getenv(
     "PPE_TG_TV_LINK_TEMPLATE",
-    "https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}"
+    "https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}",
 ).strip()
 
 STATE_PATH = os.getenv("PPE_TG_STATE_PATH", "/opt/polaris-phase-engine/.tg_forwarder_state.json").strip()
@@ -35,7 +34,7 @@ STATE_MAX = int(os.getenv("PPE_TG_STATE_MAX", "5000"))
 STATE_TTL_SEC = int(os.getenv("PPE_TG_STATE_TTL_SEC", str(7 * 24 * 3600)))  # 7 дней
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.0"})
+SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.1"})
 
 
 def _tv_link(symbol: str) -> str:
@@ -78,7 +77,6 @@ def _prune_state(state: Dict[str, int]) -> Dict[str, int]:
     now = int(time.time())
     state = {k: v for k, v in state.items() if (now - int(v)) <= STATE_TTL_SEC}
     if len(state) > STATE_MAX:
-        # оставляем самые новые
         items = sorted(state.items(), key=lambda kv: kv[1], reverse=True)[:STATE_MAX]
         state = dict(items)
     return state
@@ -129,11 +127,13 @@ def _format_conf(sig: Dict[str, Any]) -> str:
     oi = sig.get("oiChangePct", None)
     dr = sig.get("deltaRatio", None)
     pc = sig.get("priceChangePct", None)
-    lb = sig.get("lookbackBars", "")
+    lb = sig.get("lookbackBars", None)
+    if lb is None:
+        lb = sig.get("windowBars", "")
 
     def pct(x: Any) -> str:
         try:
-            return f"{float(x)*100:.2f}%"
+            return f"{float(x) * 100:.2f}%"
         except Exception:
             return "n/a"
 
@@ -160,7 +160,6 @@ def _format_message(sig: Dict[str, Any]) -> str:
         return _format_pre(sig)
     if kind == "CONF":
         return _format_conf(sig)
-    # fallback
     return f"ℹ️ `{sig}`"
 
 
