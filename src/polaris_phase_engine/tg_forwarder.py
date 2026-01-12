@@ -15,14 +15,14 @@ load_dotenv()
 
 logger = logging.getLogger("polaris-tg-forwarder")
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("PPE_TG_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
 TG_BOT_TOKEN = os.getenv("PPE_TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("PPE_TG_CHAT_ID", "").strip()
-POLL_INTERVAL = int(os.getenv("PPE_TG_POLL_INTERVAL", "60"))
 
+POLL_INTERVAL = int(os.getenv("PPE_TG_POLL_INTERVAL", "60"))
 SIGNALS_URL = os.getenv("PPE_TG_SIGNALS_URL", "http://127.0.0.1:8001/signals").strip()
 
 TV_LINK_TEMPLATE = os.getenv(
@@ -31,17 +31,16 @@ TV_LINK_TEMPLATE = os.getenv(
 ).strip()
 
 STATE_PATH = os.getenv("PPE_TG_STATE_PATH", "/opt/polaris-phase-engine/.tg_forwarder_state.json").strip()
-STATE_MAX = int(os.getenv("PPE_TG_STATE_MAX", "5000"))
-STATE_TTL_SEC = int(os.getenv("PPE_TG_STATE_TTL_SEC", str(7 * 24 * 3600)))  # 7 дней
+STATE_MAX_UIDS = int(os.getenv("PPE_TG_STATE_MAX", "5000"))
+STATE_TTL_SEC = int(os.getenv("PPE_TG_STATE_TTL_SEC", str(7 * 24 * 3600)))  # 7 days
 
-# Для нового формата /signals:
-# - changes (default): шлём только если изменились phase/side (первый раз — отправим)
-# - impulse_only: шлём только impulse и только на изменениях
-# - all: шлём каждый цикл (осторожно: спам)
-ENGINE_MODE = os.getenv("PPE_TG_ENGINE_MODE", "changes").strip().lower()
+ENGINE_MODE = os.getenv("PPE_TG_ENGINE_MODE", "changes").strip().lower()  # "changes" | "all"
+ENGINE_SEND_STARTUP = os.getenv("PPE_TG_ENGINE_SEND_STARTUP", "true").lower() in ("1", "true", "yes", "on")
+
+HTTP_TIMEOUT_SEC = int(os.getenv("PPE_TG_HTTP_TIMEOUT", "15"))
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.2"})
+SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.3"})
 
 
 def _tv_link(symbol: str) -> str:
@@ -61,199 +60,106 @@ def _ts_to_str(ts: Optional[int]) -> str:
         return ""
 
 
-# ---------- STATE (v2) ----------
-# state = {"v":2, "sent": {"KEY": {"ts": int, "sig": str}}}
+def _fmt_num(x: Any, digits: int = 2, suffix: bool = True) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        return "n/a"
+    if not suffix:
+        return f"{v:.{digits}f}"
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if v >= div:
+            return f"{sign}{v / div:.{digits}f}{unit}"
+    return f"{sign}{v:.{digits}f}"
+
+
+def _fmt_pct(x: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(x) * 100:.{digits}f}%"
+    except Exception:
+        return "n/a"
+
+
 def _load_state() -> Dict[str, Any]:
+    """
+    new format:
+      { "uids": {uid: ts}, "last": {symbol: {"fp": "...", "ts": ...}} }
+    legacy format:
+      { uid: ts, ... }
+    """
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             raw = json.load(f)
 
-        # Новый формат
-        if isinstance(raw, dict) and raw.get("v") == 2 and isinstance(raw.get("sent"), dict):
-            sent: Dict[str, Dict[str, Any]] = {}
-            for k, rec in raw["sent"].items():
-                if not isinstance(k, str) or not isinstance(rec, dict):
+        if isinstance(raw, dict) and "uids" in raw and "last" in raw:
+            uids = raw.get("uids", {}) if isinstance(raw.get("uids", {}), dict) else {}
+            last = raw.get("last", {}) if isinstance(raw.get("last", {}), dict) else {}
+
+            uids2 = {str(k): int(v) for k, v in uids.items() if isinstance(v, (int, float, str))}
+            last2: Dict[str, Dict[str, Any]] = {}
+            for sym, v in last.items():
+                if not isinstance(v, dict):
                     continue
-                ts = int(rec.get("ts", 0) or 0)
-                sig = str(rec.get("sig", "") or "")
-                if ts > 0:
-                    sent[k] = {"ts": ts, "sig": sig}
-            return {"v": 2, "sent": sent}
+                fp = str(v.get("fp", "")).strip()
+                ts = int(v.get("ts", 0) or 0)
+                if sym and fp:
+                    last2[str(sym).upper()] = {"fp": fp, "ts": ts}
+            return {"uids": uids2, "last": last2}
 
-        # Старый формат: dict[str,int]
         if isinstance(raw, dict):
-            sent = {}
-            ok = True
+            uids = {}
             for k, v in raw.items():
-                if not isinstance(k, str):
-                    ok = False
-                    break
                 try:
-                    ts = int(v)
+                    uids[str(k)] = int(v)
                 except Exception:
-                    ok = False
-                    break
-                sent[k] = {"ts": ts, "sig": ""}
-
-            if ok:
-                return {"v": 2, "sent": sent}
-
+                    continue
+            return {"uids": uids, "last": {}}
     except Exception:
         pass
-
-    return {"v": 2, "sent": {}}
+    return {"uids": {}, "last": {}}
 
 
 def _save_state(state: Dict[str, Any]) -> None:
     try:
+        tmp = {"uids": state.get("uids", {}), "last": state.get("last", {})}
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
+            json.dump(tmp, f, ensure_ascii=False)
     except Exception as e:
         logger.warning("Failed to save state: %s", e)
 
 
 def _prune_state(state: Dict[str, Any]) -> Dict[str, Any]:
     now = int(time.time())
-    sent = state.get("sent", {})
-    if not isinstance(sent, dict):
-        sent = {}
+    uids: Dict[str, int] = state.get("uids", {}) if isinstance(state.get("uids", {}), dict) else {}
+    last: Dict[str, Dict[str, Any]] = state.get("last", {}) if isinstance(state.get("last", {}), dict) else {}
 
-    # TTL
-    kept: Dict[str, Dict[str, Any]] = {}
-    for k, rec in sent.items():
-        if not isinstance(k, str) or not isinstance(rec, dict):
-            continue
-        ts = int(rec.get("ts", 0) or 0)
-        if ts <= 0:
-            continue
-        if (now - ts) <= STATE_TTL_SEC:
-            kept[k] = {"ts": ts, "sig": str(rec.get("sig", "") or "")}
+    uids = {k: int(v) for k, v in uids.items() if (now - int(v)) <= STATE_TTL_SEC}
 
-    # MAX
-    if len(kept) > STATE_MAX:
-        items = sorted(kept.items(), key=lambda kv: kv[1]["ts"], reverse=True)[:STATE_MAX]
-        kept = dict(items)
+    if len(uids) > STATE_MAX_UIDS:
+        items = sorted(uids.items(), key=lambda kv: kv[1], reverse=True)[:STATE_MAX_UIDS]
+        uids = dict(items)
 
-    return {"v": 2, "sent": kept}
-
-
-# ---------- legacy PRE/CONF ----------
-def _make_uid(sig: Dict[str, Any]) -> str:
-    kind = str(sig.get("kind", "")).upper()
-    symbol = str(sig.get("symbol", "")).upper()
-    side = str(sig.get("side", "")).upper()
-    ctype = str(sig.get("confirmType", "")).upper()
-    ts = sig.get("generatedAt") or sig.get("timestamp") or sig.get("ts") or ""
-    return f"{kind}|{ctype}|{symbol}|{side}|{ts}"
-
-
-def _format_pre(sig: Dict[str, Any]) -> str:
-    symbol = sig.get("symbol", "")
-    side = sig.get("side", "")
-    phase = sig.get("phase", "")
-    interval = sig.get("interval", "4h")
-    bars = sig.get("barsInPhase", "")
-    trend = sig.get("trendDir", "")
-    t = _ts_to_str(sig.get("generatedAt"))
-    link = _tv_link(symbol)
-
-    trend_txt = "UP ↑" if int(trend or 0) > 0 else ("DOWN ↓" if int(trend or 0) < 0 else "FLAT →")
-
-    lines = [
-        f"🟡 PRE {side}  {symbol}",
-        f"ctx: {interval} {phase} | bars: {bars} | trend: {trend_txt}",
-    ]
-    if t:
-        lines.append(f"time: {t}")
-    lines.append(f"TV: {link}")
-    return "\n".join(lines)
-
-
-def _format_conf(sig: Dict[str, Any]) -> str:
-    symbol = sig.get("symbol", "")
-    side = sig.get("side", "")
-    ctype = sig.get("confirmType", "CONF")
-    phase = sig.get("phase", "")
-    interval = sig.get("interval", "4h")
-    trig = sig.get("triggerInterval", "1h")
-    bars = sig.get("barsInPhase", "")
-    t = _ts_to_str(sig.get("generatedAt"))
-    link = _tv_link(symbol)
-
-    oi = sig.get("oiChangePct", None)
-    dr = sig.get("deltaRatio", None)
-    pc = sig.get("priceChangePct", None)
-    lb = sig.get("lookbackBars", None)
-    if lb is None:
-        lb = sig.get("windowBars", "")
-
-    def pct(x: Any) -> str:
-        try:
-            return f"{float(x) * 100:.2f}%"
-        except Exception:
-            return "n/a"
-
-    def num(x: Any) -> str:
-        try:
-            return f"{float(x):.3f}"
-        except Exception:
-            return "n/a"
-
-    lines = [
-        f"✅ CONF {ctype}  {symbol} -> {side}",
-        f"ctx: {interval} {phase} | bars: {bars} | tf: {trig} | lb: {lb}",
-        f"OI: {pct(oi)} | Δ: {num(dr)} | Price: {pct(pc)}",
-    ]
-    if t:
-        lines.append(f"time: {t}")
-    lines.append(f"TV: {link}")
-    return "\n".join(lines)
-
-
-# ---------- engine /signals ----------
-def _fmt_pct(x: Any) -> str:
-    try:
-        return f"{float(x) * 100:.2f}%"
-    except Exception:
-        return "n/a"
-
-
-def _fmt_num(x: Any) -> str:
-    try:
-        v = float(x)
-    except Exception:
-        return "n/a"
-
-    a = abs(v)
-    if a >= 1_000_000_000:
-        return f"{v / 1_000_000_000:.2f}B"
-    if a >= 1_000_000:
-        return f"{v / 1_000_000:.2f}M"
-    if a >= 1_000:
-        return f"{v / 1_000:.2f}K"
-    if a < 1:
-        s = f"{v:.6f}".rstrip("0").rstrip(".")
-        return s if s else "0"
-    s = f"{v:.4f}".rstrip("0").rstrip(".")
-    return s if s else "0"
+    return {"uids": uids, "last": last}
 
 
 def _is_engine_signal(sig: Dict[str, Any]) -> bool:
-    return (
-        isinstance(sig, dict)
-        and "kind" not in sig
-        and "symbol" in sig
-        and "side" in sig
-        and "phase" in sig
-        and "ts" in sig
-        and "info" in sig
-    )
+    return "symbol" in sig and "side" in sig and "phase" in sig and isinstance(sig.get("info"), dict)
 
 
-def _engine_signature(sig: Dict[str, Any]) -> str:
-    phase = str(sig.get("phase", "")).lower()
+def _make_uid_engine(sig: Dict[str, Any]) -> str:
+    symbol = str(sig.get("symbol", "")).upper()
     side = str(sig.get("side", "")).upper()
-    return f"{phase}|{side}"
+    phase = str(sig.get("phase", "")).lower()
+    ts = sig.get("ts") or ""
+    return f"ENGINE|{symbol}|{side}|{phase}|{ts}"
+
+
+def _engine_fingerprint(sig: Dict[str, Any]) -> str:
+    side = str(sig.get("side", "")).upper()
+    phase = str(sig.get("phase", "")).lower()
+    return f"{side}|{phase}"
 
 
 def _format_engine(sig: Dict[str, Any]) -> str:
@@ -262,31 +168,46 @@ def _format_engine(sig: Dict[str, Any]) -> str:
     phase = str(sig.get("phase", "")).lower()
     price = sig.get("price", None)
     ts = sig.get("ts", None)
-    info = sig.get("info", {}) or {}
+    info = sig.get("info", {}) if isinstance(sig.get("info", {}), dict) else {}
 
-    interval = str(info.get("interval", "") or "")
+    interval = info.get("interval", "4h")
     oi = info.get("oi", None)
-    pd = info.get("priceDelta", None)
-    pdp = info.get("priceDeltaPct", None)
-    rng = info.get("rangePct", None)
-    vol = info.get("volLast", None)
-    last24 = info.get("lastPrice24h", None)
+    pd_pct = info.get("priceDeltaPct", None)
+    rng_pct = info.get("rangePct", None)
+    vol_last = info.get("volLast", None)
 
-    arrow = "🟢" if side == "LONG" else "🔴"
-    ph = "⚡ impulse" if phase == "impulse" else "🧱 range"
+    # CVD (prefer quote)
+    cvd_w = info.get("cvdWindow", None)
+    cvd_q = info.get("cvdQuote", None)
+    cvd_lq = info.get("cvdLastQuote", None)
+    tb_pct = info.get("takerBuyPctLast", None)
+
+    link = _tv_link(symbol)
     t = _ts_to_str(ts)
 
-    lines = [f"{arrow} {symbol} {side}  ({ph}{' ' + interval if interval else ''})"]
-    lines.append(f"Price: {_fmt_num(price)} | Δ24h: {_fmt_num(pd)} ({_fmt_pct(pdp)}) | last24h: {_fmt_num(last24)}")
-    lines.append(f"OI: {_fmt_num(oi)} | Vol(last): {_fmt_num(vol)} | Range: {_fmt_pct(rng)}")
+    lines = [
+        f"📡 ENGINE  {symbol}  {side}  {phase}",
+        f"tf: {interval} | price: {_fmt_num(price, digits=2, suffix=False)}",
+        f"ΔP: {_fmt_pct(pd_pct)} | OI: {_fmt_num(oi)} | vol: {_fmt_num(vol_last)} | rng: {_fmt_pct(rng_pct)}",
+    ]
+
+    if cvd_w is not None and (cvd_q is not None or cvd_lq is not None):
+        cvd_line = f"CVD({cvd_w}): {_fmt_num(cvd_q)}"
+        if cvd_lq is not None:
+            cvd_line += f" | ΔCVD(last): {_fmt_num(cvd_lq)}"
+        if tb_pct is not None:
+            cvd_line += f" | takerBuy: {_fmt_pct(tb_pct)}"
+        lines.append(cvd_line)
+
     if t:
-        lines.append(f"Time: {t}")
-    lines.append(f"TV: {_tv_link(symbol)}")
+        lines.append(f"time: {t}")
+
+    lines.append(f"TV: {link}")
     return "\n".join(lines)
 
 
 def _fetch_signals() -> List[Dict[str, Any]]:
-    r = SESSION.get(SIGNALS_URL, timeout=10)
+    r = SESSION.get(SIGNALS_URL, timeout=HTTP_TIMEOUT_SEC)
     r.raise_for_status()
     data = r.json()
     sigs = data.get("signals", [])
@@ -306,7 +227,7 @@ def _send_to_telegram(text: str) -> None:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    r = SESSION.post(url, json=payload, timeout=10)
+    r = SESSION.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
     r.raise_for_status()
 
 
@@ -324,60 +245,56 @@ def main() -> None:
     )
 
     state = _prune_state(_load_state())
+    uids: Dict[str, int] = state.get("uids", {})
+    last: Dict[str, Dict[str, Any]] = state.get("last", {})
+
+    first_cycle = True
 
     while True:
         try:
             sigs = _fetch_signals()
             logger.info("Fetched %d signals", len(sigs))
 
-            sent_any = False
             now = int(time.time())
-            sent = state.get("sent", {})
-            if not isinstance(sent, dict):
-                sent = {}
+            sent_any = False
 
             for sig in sigs:
-                # NEW engine format
-                if _is_engine_signal(sig):
-                    phase = str(sig.get("phase", "")).lower()
-                    if ENGINE_MODE == "impulse_only" and phase != "impulse":
-                        continue
-
-                    symbol = str(sig.get("symbol", "")).upper()
-                    key = f"ENG|{symbol}"
-                    sigval = _engine_signature(sig)
-
-                    rec = sent.get(key, {})
-                    if ENGINE_MODE != "all" and isinstance(rec, dict) and rec.get("sig") == sigval:
-                        continue
-
-                    _send_to_telegram(_format_engine(sig))
-                    sent[key] = {"ts": now, "sig": sigval}
-                    sent_any = True
-                    logger.info("Sent ENGINE signal to Telegram: %s %s %s", symbol, sig.get("side"), sig.get("phase"))
+                if not _is_engine_signal(sig):
                     continue
 
-                # legacy PRE/CONF
-                uid = _make_uid(sig)
-                if uid in sent:
+                symbol = str(sig.get("symbol", "")).upper()
+                uid = _make_uid_engine(sig)
+                fp = _engine_fingerprint(sig)
+
+                if uid in uids:
                     continue
 
-                kind = str(sig.get("kind", "")).upper()
-                if kind == "PRE":
-                    msg = _format_pre(sig)
-                elif kind == "CONF":
-                    msg = _format_conf(sig)
-                else:
-                    msg = f"INFO: {sig}"
+                if ENGINE_MODE == "changes":
+                    prev_fp = (last.get(symbol, {}) or {}).get("fp")
+                    if prev_fp == fp:
+                        uids[uid] = now
+                        continue
 
+                    if first_cycle and not ENGINE_SEND_STARTUP and prev_fp is None:
+                        last[symbol] = {"fp": fp, "ts": now}
+                        uids[uid] = now
+                        continue
+
+                msg = _format_engine(sig)
                 _send_to_telegram(msg)
-                sent[uid] = {"ts": now, "sig": ""}
+
+                uids[uid] = now
+                last[symbol] = {"fp": fp, "ts": now}
                 sent_any = True
-                logger.info("Sent legacy message to Telegram")
+
+                logger.info("Sent ENGINE signal to Telegram: %s %s %s", symbol, sig.get("side"), sig.get("phase"))
+
+            first_cycle = False
 
             if sent_any:
-                state["sent"] = sent
-                state = _prune_state(state)
+                state = _prune_state({"uids": uids, "last": last})
+                uids = state["uids"]
+                last = state["last"]
                 _save_state(state)
 
         except Exception as e:
