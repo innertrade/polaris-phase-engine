@@ -15,13 +15,12 @@ load_dotenv()
 
 logger = logging.getLogger("polaris-tg-forwarder")
 logging.basicConfig(
-    level=os.getenv("PPE_TG_LOG_LEVEL", "INFO").upper(),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
 TG_BOT_TOKEN = os.getenv("PPE_TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("PPE_TG_CHAT_ID", "").strip()
-
 POLL_INTERVAL = int(os.getenv("PPE_TG_POLL_INTERVAL", "60"))
 SIGNALS_URL = os.getenv("PPE_TG_SIGNALS_URL", "http://127.0.0.1:8001/signals").strip()
 
@@ -31,16 +30,11 @@ TV_LINK_TEMPLATE = os.getenv(
 ).strip()
 
 STATE_PATH = os.getenv("PPE_TG_STATE_PATH", "/opt/polaris-phase-engine/.tg_forwarder_state.json").strip()
-STATE_MAX_UIDS = int(os.getenv("PPE_TG_STATE_MAX", "5000"))
+STATE_MAX = int(os.getenv("PPE_TG_STATE_MAX", "5000"))
 STATE_TTL_SEC = int(os.getenv("PPE_TG_STATE_TTL_SEC", str(7 * 24 * 3600)))  # 7 days
 
-ENGINE_MODE = os.getenv("PPE_TG_ENGINE_MODE", "changes").strip().lower()  # "changes" | "all"
-ENGINE_SEND_STARTUP = os.getenv("PPE_TG_ENGINE_SEND_STARTUP", "true").lower() in ("1", "true", "yes", "on")
-
-HTTP_TIMEOUT_SEC = int(os.getenv("PPE_TG_HTTP_TIMEOUT", "15"))
-
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.3"})
+SESSION.headers.update({"User-Agent": "polaris-tg-forwarder/2.2"})
 
 
 def _tv_link(symbol: str) -> str:
@@ -60,154 +54,135 @@ def _ts_to_str(ts: Optional[int]) -> str:
         return ""
 
 
-def _fmt_num(x: Any, digits: int = 2, suffix: bool = True) -> str:
+def _human_num(x: Any) -> str:
     try:
         v = float(x)
     except Exception:
         return "n/a"
-    if not suffix:
-        return f"{v:.{digits}f}"
-    sign = "-" if v < 0 else ""
+    sgn = "-" if v < 0 else ""
     v = abs(v)
     for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
         if v >= div:
-            return f"{sign}{v / div:.{digits}f}{unit}"
-    return f"{sign}{v:.{digits}f}"
+            return f"{sgn}{v/div:.2f}{unit}"
+    return f"{sgn}{v:.2f}"
 
 
-def _fmt_pct(x: Any, digits: int = 2) -> str:
+def _pct(x: Any) -> str:
     try:
-        return f"{float(x) * 100:.{digits}f}%"
+        return f"{float(x)*100:.2f}%"
     except Exception:
         return "n/a"
 
 
-def _load_state() -> Dict[str, Any]:
-    """
-    new format:
-      { "uids": {uid: ts}, "last": {symbol: {"fp": "...", "ts": ...}} }
-    legacy format:
-      { uid: ts, ... }
-    """
+def _num(x: Any, nd: int = 2) -> str:
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "n/a"
+
+
+def _load_state() -> Dict[str, int]:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             raw = json.load(f)
-
-        if isinstance(raw, dict) and "uids" in raw and "last" in raw:
-            uids = raw.get("uids", {}) if isinstance(raw.get("uids", {}), dict) else {}
-            last = raw.get("last", {}) if isinstance(raw.get("last", {}), dict) else {}
-
-            uids2 = {str(k): int(v) for k, v in uids.items() if isinstance(v, (int, float, str))}
-            last2: Dict[str, Dict[str, Any]] = {}
-            for sym, v in last.items():
-                if not isinstance(v, dict):
-                    continue
-                fp = str(v.get("fp", "")).strip()
-                ts = int(v.get("ts", 0) or 0)
-                if sym and fp:
-                    last2[str(sym).upper()] = {"fp": fp, "ts": ts}
-            return {"uids": uids2, "last": last2}
-
         if isinstance(raw, dict):
-            uids = {}
-            for k, v in raw.items():
-                try:
-                    uids[str(k)] = int(v)
-                except Exception:
-                    continue
-            return {"uids": uids, "last": {}}
+            return {str(k): int(v) for k, v in raw.items()}
     except Exception:
         pass
-    return {"uids": {}, "last": {}}
+    return {}
 
 
-def _save_state(state: Dict[str, Any]) -> None:
+def _save_state(state: Dict[str, int]) -> None:
     try:
-        tmp = {"uids": state.get("uids", {}), "last": state.get("last", {})}
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(tmp, f, ensure_ascii=False)
+            json.dump(state, f, ensure_ascii=False)
     except Exception as e:
         logger.warning("Failed to save state: %s", e)
 
 
-def _prune_state(state: Dict[str, Any]) -> Dict[str, Any]:
+def _prune_state(state: Dict[str, int]) -> Dict[str, int]:
     now = int(time.time())
-    uids: Dict[str, int] = state.get("uids", {}) if isinstance(state.get("uids", {}), dict) else {}
-    last: Dict[str, Dict[str, Any]] = state.get("last", {}) if isinstance(state.get("last", {}), dict) else {}
-
-    uids = {k: int(v) for k, v in uids.items() if (now - int(v)) <= STATE_TTL_SEC}
-
-    if len(uids) > STATE_MAX_UIDS:
-        items = sorted(uids.items(), key=lambda kv: kv[1], reverse=True)[:STATE_MAX_UIDS]
-        uids = dict(items)
-
-    return {"uids": uids, "last": last}
+    state = {k: v for k, v in state.items() if (now - int(v)) <= STATE_TTL_SEC}
+    if len(state) > STATE_MAX:
+        items = sorted(state.items(), key=lambda kv: kv[1], reverse=True)[:STATE_MAX]
+        state = dict(items)
+    return state
 
 
-def _is_engine_signal(sig: Dict[str, Any]) -> bool:
-    return "symbol" in sig and "side" in sig and "phase" in sig and isinstance(sig.get("info"), dict)
-
-
-def _make_uid_engine(sig: Dict[str, Any]) -> str:
+def _make_uid(sig: Dict[str, Any]) -> str:
+    kind = str(sig.get("kind", "")).upper()
     symbol = str(sig.get("symbol", "")).upper()
     side = str(sig.get("side", "")).upper()
-    phase = str(sig.get("phase", "")).lower()
-    ts = sig.get("ts") or ""
-    return f"ENGINE|{symbol}|{side}|{phase}|{ts}"
+    ctype = str(sig.get("confirmType", "")).upper()
+    ts = sig.get("generatedAt") or sig.get("ts") or sig.get("timestamp") or ""
+    # kind|type|symbol|side|ts is enough for de-dupe
+    return f"{kind}|{ctype}|{symbol}|{side}|{ts}"
 
 
-def _engine_fingerprint(sig: Dict[str, Any]) -> str:
-    side = str(sig.get("side", "")).upper()
-    phase = str(sig.get("phase", "")).lower()
-    return f"{side}|{phase}"
-
-
-def _format_engine(sig: Dict[str, Any]) -> str:
-    symbol = str(sig.get("symbol", "")).upper()
-    side = str(sig.get("side", "")).upper()
-    phase = str(sig.get("phase", "")).lower()
-    price = sig.get("price", None)
-    ts = sig.get("ts", None)
-    info = sig.get("info", {}) if isinstance(sig.get("info", {}), dict) else {}
-
-    interval = info.get("interval", "4h")
-    oi = info.get("oi", None)
-    pd_pct = info.get("priceDeltaPct", None)
-    rng_pct = info.get("rangePct", None)
-    vol_last = info.get("volLast", None)
-
-    # CVD (prefer quote)
-    cvd_w = info.get("cvdWindow", None)
-    cvd_q = info.get("cvdQuote", None)
-    cvd_lq = info.get("cvdLastQuote", None)
-    tb_pct = info.get("takerBuyPctLast", None)
-
+def _format_pre(sig: Dict[str, Any]) -> str:
+    symbol = sig.get("symbol", "")
+    side = sig.get("side", "")
+    phase = sig.get("phase", "")
+    interval = sig.get("interval", "4h")
+    bars = sig.get("barsInPhase", "")
+    trend = sig.get("trendDir", "")
+    t = _ts_to_str(sig.get("generatedAt"))
     link = _tv_link(symbol)
-    t = _ts_to_str(ts)
+
+    trend_txt = "UP ↑" if int(trend or 0) > 0 else ("DOWN ↓" if int(trend or 0) < 0 else "FLAT →")
 
     lines = [
-        f"📡 ENGINE  {symbol}  {side}  {phase}",
-        f"tf: {interval} | price: {_fmt_num(price, digits=2, suffix=False)}",
-        f"ΔP: {_fmt_pct(pd_pct)} | OI: {_fmt_num(oi)} | vol: {_fmt_num(vol_last)} | rng: {_fmt_pct(rng_pct)}",
+        f"🟡 *PRE {side}*  `{symbol}`",
+        f"_ctx_: {interval} {phase} | bars: {bars} | trend: {trend_txt}",
+        "⚠️ вход: *только после ретеста на 15m* (не по первой свече).",
     ]
-
-    if cvd_w is not None and (cvd_q is not None or cvd_lq is not None):
-        cvd_line = f"CVD({cvd_w}): {_fmt_num(cvd_q)}"
-        if cvd_lq is not None:
-            cvd_line += f" | ΔCVD(last): {_fmt_num(cvd_lq)}"
-        if tb_pct is not None:
-            cvd_line += f" | takerBuy: {_fmt_pct(tb_pct)}"
-        lines.append(cvd_line)
-
     if t:
-        lines.append(f"time: {t}")
-
-    lines.append(f"TV: {link}")
+        lines.append(f"_time_: {t}")
+    lines.append(f"🔗 TV: {link}")
     return "\n".join(lines)
 
 
+def _format_conf(sig: Dict[str, Any]) -> str:
+    symbol = sig.get("symbol", "")
+    side = sig.get("side", "")
+    ctype = sig.get("confirmType", "CONF")
+    phase = sig.get("phase", "")
+    interval = sig.get("interval", "4h")
+    trig = sig.get("triggerInterval", "1h")
+    bars = sig.get("barsInPhase", "")
+    lb = sig.get("lookbackBars", "")
+    t = _ts_to_str(sig.get("generatedAt"))
+    link = _tv_link(symbol)
+
+    pc = sig.get("priceChangePct", None)
+    oi = sig.get("oiChangePct", None)
+    dr = sig.get("deltaRatio", None)
+    cvd_q = sig.get("cvdDeltaQuote", None)
+
+    lines = [
+        f"✅ *CONF* `{ctype}`  `{symbol}`  → *{side}*",
+        f"_ctx_: {interval} {phase} | bars: {bars} | _tf_: {trig} | N: {lb}",
+        f"ΔP: {_pct(pc)} | ΔOI: {_pct(oi)} | CVDΔ: {_human_num(cvd_q)} | ΔR: {_num(dr, 3)}",
+        "🎯 вход: *только ретест 15m* (pullback), не “вжух” по первой.",
+    ]
+    if t:
+        lines.append(f"_time_: {t}")
+    lines.append(f"🔗 TV: {link}")
+    return "\n".join(lines)
+
+
+def _format_message(sig: Dict[str, Any]) -> str:
+    kind = str(sig.get("kind", "")).upper()
+    if kind == "PRE":
+        return _format_pre(sig)
+    if kind == "CONF":
+        return _format_conf(sig)
+    # fallback
+    return f"ℹ️ `{sig}`"
+
+
 def _fetch_signals() -> List[Dict[str, Any]]:
-    r = SESSION.get(SIGNALS_URL, timeout=HTTP_TIMEOUT_SEC)
+    r = SESSION.get(SIGNALS_URL, timeout=10)
     r.raise_for_status()
     data = r.json()
     sigs = data.get("signals", [])
@@ -227,7 +202,7 @@ def _send_to_telegram(text: str) -> None:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    r = SESSION.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
+    r = SESSION.post(url, json=payload, timeout=10)
     r.raise_for_status()
 
 
@@ -236,65 +211,32 @@ def main() -> None:
         logger.error("PPE_TG_BOT_TOKEN is not set or PPE_TG_CHAT_ID is not set")
         return
 
-    logger.info(
-        "Starting TG forwarder: url=%s chat_id=%s interval=%ss mode=%s",
-        SIGNALS_URL,
-        TG_CHAT_ID,
-        POLL_INTERVAL,
-        ENGINE_MODE,
-    )
+    logger.info("Starting TG forwarder: url=%s chat_id=%s interval=%ss", SIGNALS_URL, TG_CHAT_ID, POLL_INTERVAL)
 
     state = _prune_state(_load_state())
-    uids: Dict[str, int] = state.get("uids", {})
-    last: Dict[str, Dict[str, Any]] = state.get("last", {})
-
-    first_cycle = True
 
     while True:
         try:
             sigs = _fetch_signals()
             logger.info("Fetched %d signals", len(sigs))
 
-            now = int(time.time())
             sent_any = False
+            now = int(time.time())
 
             for sig in sigs:
-                if not _is_engine_signal(sig):
+                uid = _make_uid(sig)
+                if uid in state:
                     continue
 
-                symbol = str(sig.get("symbol", "")).upper()
-                uid = _make_uid_engine(sig)
-                fp = _engine_fingerprint(sig)
-
-                if uid in uids:
-                    continue
-
-                if ENGINE_MODE == "changes":
-                    prev_fp = (last.get(symbol, {}) or {}).get("fp")
-                    if prev_fp == fp:
-                        uids[uid] = now
-                        continue
-
-                    if first_cycle and not ENGINE_SEND_STARTUP and prev_fp is None:
-                        last[symbol] = {"fp": fp, "ts": now}
-                        uids[uid] = now
-                        continue
-
-                msg = _format_engine(sig)
+                msg = _format_message(sig)
                 _send_to_telegram(msg)
 
-                uids[uid] = now
-                last[symbol] = {"fp": fp, "ts": now}
+                state[uid] = now
                 sent_any = True
-
-                logger.info("Sent ENGINE signal to Telegram: %s %s %s", symbol, sig.get("side"), sig.get("phase"))
-
-            first_cycle = False
+                logger.info("Sent signal to Telegram: %s %s %s", sig.get("symbol"), sig.get("kind"), sig.get("confirmType"))
 
             if sent_any:
-                state = _prune_state({"uids": uids, "last": last})
-                uids = state["uids"]
-                last = state["last"]
+                state = _prune_state(state)
                 _save_state(state)
 
         except Exception as e:
