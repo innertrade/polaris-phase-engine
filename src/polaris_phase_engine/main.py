@@ -47,6 +47,13 @@ CONF_DELTA_RATIO_THR = float(os.getenv("PPE_CONF_DELTA_RATIO_THR", "0.15"))
 # Binance returns both sumOpenInterest (contracts) and sumOpenInterestValue (USD-ish)
 CONF_OI_VALUE_MODE = os.getenv("PPE_CONF_OI_VALUE_MODE", "value").strip().lower()  # "value" or "contracts"
 CONF_OI_MOVE_PCT = float(os.getenv("PPE_CONF_OI_MOVE_PCT", "0.01"))  # 1% minimal OI rise
+
+# ---- CVD (Cumulative Volume Delta) ----
+# CVD считается по taker-buy (market buys) минус taker-sell (market sells)
+# на таймфрейме CONF_INTERVAL. Используем нормализованный deltaRatio как
+# фильтр (не зависит от абсолютного объёма).
+CVD_ENABLED = _to_bool(os.getenv('PPE_CVD_ENABLED', 'true'))
+CVD_WINDOW_BARS = int(os.getenv('PPE_CVD_WINDOW_BARS', '120'))
 # ---- CACHE to make /signals instant ----
 CACHE_ENABLED = os.getenv("PPE_CACHE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 CACHE_REFRESH_SEC = int(os.getenv("PPE_CACHE_REFRESH_SEC", "60"))
@@ -327,172 +334,132 @@ def _compute_pre_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, An
     return signals
 # ===================== SIGNALS: CONF v2 (LONG-1/2 SHORT-1/2) ===================== #
 def _conf_context(ph: Dict[str, Any]) -> Optional[str]:
-    """Return 'LONG' or 'SHORT' if PRE context is active right now, else None."""
-    if not ph or ph.get("error"):
+    """Direction context from 4h phases.
+
+    We do NOT gate CONF by 'bars in phase': CONF should still be able to appear
+    in CORR/RANGE/PUMP/DUMP depending on trendDir, because that's exactly where
+    absorption/reversal signals happen.
+    """
+    if not ph or ph.get('error'):
         return None
-    phase = ph.get("phase")
-    trend_dir = int(ph.get("trendDir") or 0)
-    pump_count = int(ph.get("pumpCount") or 0)
-    dump_count = int(ph.get("dumpCount") or 0)
-    if phase == "PUMP" and trend_dir > 0 and pump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL:
-        return "LONG"
-    if phase == "DUMP" and trend_dir < 0 and dump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL:
-        return "SHORT"
+    phase = str(ph.get('phase') or '').upper()
+    trend_dir = int(ph.get('trendDir') or 0)
+    if trend_dir > 0:
+        return 'LONG'
+    if trend_dir < 0:
+        return 'SHORT'
+    if phase == 'PUMP':
+        return 'LONG'
+    if phase == 'DUMP':
+        return 'SHORT'
     return None
 def _compute_conf_signals_v2(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """CONF сигналы (1h) по ТЗ:
+
+    LONG-1  (ABSORB bottom):   OI↑ + CVD↓ + Price ~flat
+    LONG-2  (BREAK up):        OI↑ + CVD↑ + Price↑
+    SHORT-1 (ABSORB top):      OI↑ + CVD↑ + Price ~flat
+    SHORT-2 (BREAK down):      OI↑ + CVD↓ + Price↓
+
+    Контекст (trend/ct) берём из 4h trendDir: в LONG-контексте показываем
+    трендовый LONG-2 и контртрендовый SHORT-1. В SHORT-контексте — трендовый
+    SHORT-2 и контртрендовый LONG-1.
+    """
     if not CONF_ENABLED:
         return []
     signals: List[Dict[str, Any]] = []
-    # ensure enough bars
     w = max(3, CONF_WINDOW_BARS)
-    need_klines = max(CONF_KLINES_LIMIT, w + 2)
-    need_oi = w + 2
+    need_klines = max(CONF_KLINES_LIMIT, max(w, CVD_WINDOW_BARS) + 3)
+    need_oi = max(200, w + 3)
+    now = int(time.time())
     for symbol, ph in phases.items():
         ctx = _conf_context(ph)
         if ctx is None:
             continue
         try:
             df = _binance_klines(symbol, CONF_INTERVAL, need_klines)
-        except Exception as exc:
-            logger.exception("CONF v2: failed to load %s %s klines: %s", symbol, CONF_INTERVAL, exc)
-            continue
-        if df.empty or len(df) < w + 2:
-            continue
-        # use the LAST closed window (avoid using the still-forming last candle if exchange returns it)
-        # Binance klines are closed bars; still, safer to just take last w+1 bars.
-        df_win = df.iloc[-(w + 1):].copy()
-        pchg = _price_change_pct(df_win)
-        dr = _delta_ratio(df_win)
-        # OI window aligned by count (not perfect time sync, but good enough for v1)
-        try:
+            if df.empty or len(df) < w + 2:
+                continue
             oi_df = _binance_open_interest_hist(symbol, CONF_INTERVAL, need_oi)
-            if oi_df.empty or len(oi_df) < 2:
-                oi_chg = 0.0
-            else:
-                oi_df_win = oi_df.iloc[-(w + 1):].copy() if len(oi_df) >= (w + 1) else oi_df.copy()
-                oi_chg = _oi_change_pct(oi_df_win)
         except Exception as exc:
-            # If OI is not available (some symbols / limits) -> skip CONF for this symbol
-            logger.warning("CONF v2: OI not available for %s: %s", symbol, exc)
+            logger.exception('CONF: failed to load data for %s: %s', symbol, exc)
             continue
-        # Conditions
-        oi_up = oi_chg >= CONF_OI_MOVE_PCT
-        price_flat = abs(pchg) <= CONF_PRICE_FLAT_PCT
+
+        # --- metrics over lookback window (w bars) ---
+        df_win = df.tail(w + 1)
+        pchg = _price_change_pct(df_win)
+        oi_chg = _oi_change_pct(oi_df, w)
+        dr = _delta_ratio(df, min(CVD_WINDOW_BARS, len(df)))
+        cvd = _compute_cvd(df, min(CVD_WINDOW_BARS, len(df)))
+
         price_up = pchg >= CONF_PRICE_MOVE_PCT
         price_dn = pchg <= -CONF_PRICE_MOVE_PCT
-        delta_pos = dr >= CONF_DELTA_RATIO_THR
-        delta_neg = dr <= -CONF_DELTA_RATIO_THR
-        now_ts = int(df_win["close_time"].iloc[-1].timestamp())
-        # LONG context
-        if ctx == "LONG":
-            # LONG-1: continuation impulse
-            if oi_up and price_up and delta_pos:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "LONG",
-                        "kind": "CONF",
-                        "confirmType": "LONG_2_BREAKOUT",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),           # 4h context
-                        "triggerInterval": CONF_INTERVAL,         # confirm TF
-                        "barsInPhase": int(ph.get("pumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "cvdDeltaQuote": cvd_last_quote,
-                        "cvdDeltaBase": cvd_last_base,
-                        "cvdQuote": cvd_quote,
-                        "takerBuyPctLast": taker_buy_pct_last,
-                        "volLast": vol_last,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
-            # LONG-2: absorption (selling pressure but price holds) -> re-accumulation before push
-            # OI up (new positions), delta negative (aggressive sells), but price flat (not falling)
-            if oi_up and price_flat and delta_neg:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "LONG",
-                        "kind": "CONF",
-                        "confirmType": "LONG_1_ABSORB",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),
-                        "triggerInterval": CONF_INTERVAL,
-                        "barsInPhase": int(ph.get("pumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "cvdDeltaQuote": cvd_last_quote,
-                        "cvdDeltaBase": cvd_last_base,
-                        "cvdQuote": cvd_quote,
-                        "takerBuyPctLast": taker_buy_pct_last,
-                        "volLast": vol_last,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
-        # SHORT context
-        if ctx == "SHORT":
-            # SHORT-1: continuation dump
-            if oi_up and price_dn and delta_neg:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "SHORT",
-                        "kind": "CONF",
-                        "confirmType": "SHORT_2_BREAKOUT",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),
-                        "triggerInterval": CONF_INTERVAL,
-                        "barsInPhase": int(ph.get("dumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "cvdDeltaQuote": cvd_last_quote,
-                        "cvdDeltaBase": cvd_last_base,
-                        "cvdQuote": cvd_quote,
-                        "takerBuyPctLast": taker_buy_pct_last,
-                        "volLast": vol_last,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
-            # SHORT-2: distribution (buyers push but price can't rise) -> bearish setup
-            # OI up (new positions), delta positive (aggressive buys), but price flat (not rising)
-            if oi_up and price_flat and delta_pos:
-                signals.append(
-                    {
-                        "symbol": symbol,
-                        "side": "SHORT",
-                        "kind": "CONF",
-                        "confirmType": "SHORT_1_ABSORB",
-                        "phase": ph.get("phase"),
-                        "interval": ph.get("interval"),
-                        "triggerInterval": CONF_INTERVAL,
-                        "barsInPhase": int(ph.get("dumpCount") or 0),
-                        "trendDir": int(ph.get("trendDir") or 0),
-                        "generatedAt": now_ts,
-                        "windowBars": w,
-                        "priceChangePct": pchg,
-                        "oiChangePct": oi_chg,
-                        "deltaRatio": dr,
-                        "cvdDeltaQuote": cvd_last_quote,
-                        "cvdDeltaBase": cvd_last_base,
-                        "cvdQuote": cvd_quote,
-                        "takerBuyPctLast": taker_buy_pct_last,
-                        "volLast": vol_last,
-                        "oiMode": CONF_OI_VALUE_MODE,
-                    }
-                )
+        price_flat = abs(pchg) <= CONF_PRICE_FLAT_PCT
+        oi_up = oi_chg >= CONF_OI_MOVE_PCT
+
+        # CVD sign: use normalized delta ratio (dr) to avoid dependence on absolute volume
+        cvd_pos = dr >= CONF_DELTA_RATIO_THR
+        cvd_neg = dr <= -CONF_DELTA_RATIO_THR
+
+        # last bar taker split
+        last = df.iloc[-1]
+        vol_last = float(last.get('volume') or 0.0)
+        buy_last = float(last.get('taker_buy_base') or 0.0)
+        sell_last = max(0.0, vol_last - buy_last)
+        taker_buy_pct_last = (buy_last / vol_last) if vol_last > 0 else None
+
+        base_payload = {
+            'kind': 'CONF',
+            'symbol': symbol,
+            'interval': INTERVAL,
+            'triggerInterval': CONF_INTERVAL,
+            'phase': ph.get('phase'),
+            'barsInPhase': ph.get('barsInPhase'),
+            'trendDir': ph.get('trendDir'),
+            'generatedAt': now,
+            'lookbackBars': w,
+            'priceChangePct': pchg,
+            'oiChangePct': oi_chg,
+            'deltaRatio': dr,
+            # CVD info
+            'cvdWindow': int(min(CVD_WINDOW_BARS, len(df))),
+            'cvdBase': cvd.get('cvd_base'),
+            'cvdQuote': cvd.get('cvd_quote'),
+            'cvdLastBase': cvd.get('cvd_last_base'),
+            'cvdLastQuote': cvd.get('cvd_last_quote'),
+            'takerBuyPctLast': taker_buy_pct_last,
+            'buyVolLast': buy_last,
+            'sellVolLast': sell_last,
+            'volLast': vol_last,
+        }
+
+        # --- Apply TЗ patterns based on 4h context ---
+        if not oi_up:
+            continue  # we don't want pure short-cover/long-closure moves
+
+        if ctx == 'LONG':
+            # Trend continuation up
+            if price_up and cvd_pos:
+                s = dict(base_payload)
+                s.update({'confirmType': 'LONG_2_BREAK', 'side': 'LONG'})
+                signals.append(s)
+            # Counter-trend reversal down (absorption at the top)
+            if price_flat and cvd_pos:
+                s = dict(base_payload)
+                s.update({'confirmType': 'SHORT_1_ABSORB', 'side': 'SHORT'})
+                signals.append(s)
+        elif ctx == 'SHORT':
+            # Trend continuation down
+            if price_dn and cvd_neg:
+                s = dict(base_payload)
+                s.update({'confirmType': 'SHORT_2_BREAK', 'side': 'SHORT'})
+                signals.append(s)
+            # Counter-trend reversal up (absorption at the bottom)
+            if price_flat and cvd_neg:
+                s = dict(base_payload)
+                s.update({'confirmType': 'LONG_1_ABSORB', 'side': 'LONG'})
+                signals.append(s)
+
     return signals
 def compute_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     pre = _compute_pre_signals(phases)
@@ -566,6 +533,8 @@ def health() -> Any:
             "interval": INTERVAL,
             "confirmEnabled": CONF_ENABLED,
             "confirmInterval": CONF_INTERVAL,
+            "cvdEnabled": CVD_ENABLED,
+            "cvdWindowBars": CVD_WINDOW_BARS,
             "cacheEnabled": CACHE_ENABLED,
             "cacheRefreshSec": CACHE_REFRESH_SEC if CACHE_ENABLED else None,
             "cacheUpdatedAt": st.get("updatedAt") if st else None,
@@ -597,13 +566,15 @@ def signals_endpoint() -> Any:
     return jsonify({"signals": signals})
 def main() -> None:
     logger.info(
-        "Starting Polaris Phase Engine on %s:%s symbols=%s interval=%s confirm=%s/%s cache=%s refresh=%ss",
+        "Starting Polaris Phase Engine on %s:%s symbols=%s interval=%s confirm=%s/%s cvd=%s window=%s cache=%s refresh=%ss",
         HTTP_HOST,
         HTTP_PORT,
         ",".join(SYMBOLS),
         INTERVAL,
         "on" if CONF_ENABLED else "off",
         CONF_INTERVAL,
+        "on" if CVD_ENABLED else "off",
+        CVD_WINDOW_BARS,
         "on" if CACHE_ENABLED else "off",
         CACHE_REFRESH_SEC,
     )
