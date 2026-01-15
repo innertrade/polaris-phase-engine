@@ -1,787 +1,615 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify
-
+# ===================== CONFIG / ENV ===================== #
 load_dotenv()
-
-# =========================
-# logging
-# =========================
+BINANCE_FAPI = os.getenv("PPE_BINANCE_FAPI", "https://fapi.binance.com")
+_raw_symbols = os.getenv("PPE_SYMBOLS", "BTCUSDT")
+SYMBOLS: List[str] = [s.strip().upper() for s in _raw_symbols.split(",") if s.strip()]
+# Base TF for phases
+INTERVAL = os.getenv("PPE_INTERVAL", "4h")
+KLINES_LIMIT = int(os.getenv("PPE_KLINES_LIMIT", "500"))
+# Phase params (sync with PolarisPhaseMVP)
+EMA_FAST = int(os.getenv("PPE_EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("PPE_EMA_SLOW", "50"))
+TREND_UP_THR = float(os.getenv("PPE_TREND_UP_THR", "0.0015"))
+TREND_DN_THR = float(os.getenv("PPE_TREND_DN_THR", "-0.0015"))
+ATR_LEN = int(os.getenv("PPE_ATR_LEN", "14"))
+ATR_Z_LEN = int(os.getenv("PPE_ATR_Z_LEN", "100"))
+ATR_QUIET = float(os.getenv("PPE_ATR_QUIET", "-0.7"))
+ATR_HOT = float(os.getenv("PPE_ATR_HOT", "0.7"))
+VOL_Z_LEN = int(os.getenv("PPE_VOL_Z_LEN", "100"))
+VOL_QUIET = float(os.getenv("PPE_VOL_QUIET", "-0.5"))
+VOL_HOT = float(os.getenv("PPE_VOL_HOT", "0.5"))
+MIN_BARS_IN_PHASE_FOR_SIGNAL = int(os.getenv("PPE_MIN_BARS_IN_PHASE_FOR_SIGNAL", "2"))
+# ---- CONF v2 (CVD + OI + Price) on confirm TF (default 1h) ----
+CONF_ENABLED = os.getenv("PPE_CONFIRM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+CONF_INTERVAL = os.getenv("PPE_CONFIRM_INTERVAL", "1h")
+CONF_KLINES_LIMIT = int(os.getenv("PPE_CONFIRM_KLINES_LIMIT", "200"))
+# window for CONF analysis in bars (of CONF_INTERVAL)
+CONF_WINDOW_BARS = int(os.getenv("PPE_CONF_WINDOW_BARS", "12"))
+# price thresholds
+CONF_PRICE_FLAT_PCT = float(os.getenv("PPE_CONF_PRICE_FLAT_PCT", "0.003"))   # 0.3% ~ "flat"
+CONF_PRICE_MOVE_PCT = float(os.getenv("PPE_CONF_PRICE_MOVE_PCT", "0.007"))   # 0.7% ~ "move"
+# delta ratio threshold (CVD change / total volume)
+CONF_DELTA_RATIO_THR = float(os.getenv("PPE_CONF_DELTA_RATIO_THR", "0.15"))
+# open interest settings
+# Binance returns both sumOpenInterest (contracts) and sumOpenInterestValue (USD-ish)
+CONF_OI_VALUE_MODE = os.getenv("PPE_CONF_OI_VALUE_MODE", "value").strip().lower()  # "value" or "contracts"
+CONF_OI_MOVE_PCT = float(os.getenv("PPE_CONF_OI_MOVE_PCT", "0.01"))  # 1% minimal OI rise
+# ---- CACHE to make /signals instant ----
+CACHE_ENABLED = os.getenv("PPE_CACHE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+CACHE_REFRESH_SEC = int(os.getenv("PPE_CACHE_REFRESH_SEC", "60"))
+CACHE_STARTUP_REFRESH = os.getenv("PPE_CACHE_STARTUP_REFRESH", "true").lower() in ("1", "true", "yes", "on")
+HTTP_HOST = os.getenv("PPE_HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.getenv("PPE_HTTP_PORT", "8001"))
+# ===================== LOGGER / HTTP ===================== #
 logger = logging.getLogger("polaris-phase-engine")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-
-# =========================
-# helpers
-# =========================
-def _env_str(name: str, default: str) -> str:
-    return os.getenv(name, default).strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "1" if default else "0").strip().lower()
-    return raw in ("1", "true", "yes", "on", "y")
-
-
-def _now_ts() -> int:
-    return int(time.time())
-
-
-def _iso_utc(ts_sec: int) -> str:
-    return datetime.fromtimestamp(int(ts_sec), tz=timezone.utc).isoformat()
-
-
-def _interval_to_ms(interval: str) -> int:
-    # supports: 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d
-    interval = (interval or "").strip().lower()
-    if interval.endswith("m"):
-        return int(interval[:-1]) * 60_000
-    if interval.endswith("h"):
-        return int(interval[:-1]) * 3_600_000
-    if interval.endswith("d"):
-        return int(interval[:-1]) * 86_400_000
-    # fallback (assume hours)
-    return 3_600_000
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-# =========================
-# config
-# =========================
-HTTP_HOST = _env_str("PPE_HTTP_HOST", "127.0.0.1")
-HTTP_PORT = _env_int("PPE_HTTP_PORT", 8001)
-
-SYMBOLS = [s.strip().upper() for s in _env_str(
-    "PPE_SYMBOLS",
-    "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,LINKUSDT,AVAXUSDT,ADAUSDT,TONUSDT",
-).split(",") if s.strip()]
-
-INTERVAL_4H = _env_str("PPE_INTERVAL", "4h")
-KLINES_LIMIT_4H = _env_int("PPE_KLINES_LIMIT", 500)
-MIN_BARS_IN_PHASE_FOR_PRE = _env_int("PPE_MIN_BARS_IN_PHASE_FOR_SIGNAL", 2)
-
-CACHE_ENABLED = _env_bool("PPE_CACHE_ENABLED", True)
-CACHE_REFRESH_SEC = _env_int("PPE_CACHE_REFRESH_SEC", 60)
-
-# phase thresholds (same “mvp” logic)
-TREND_THR = _env_float("PPE_TREND_THR", 0.0015)
-PH_ATR_Z_THR = _env_float("PPE_PHASE_ATR_Z_THR", 0.7)
-PH_VOL_Z_THR = _env_float("PPE_PHASE_VOL_Z_THR", 0.5)
-PH_ACC_ATR_Z_THR = _env_float("PPE_PHASE_ACC_ATR_Z_THR", -0.7)
-PH_ACC_VOL_Z_THR = _env_float("PPE_PHASE_ACC_VOL_Z_THR", -0.5)
-Z_WINDOW = _env_int("PPE_Z_WINDOW", 100)
-
-# CONF (per TЗ)
-CONFIRM_ENABLED = _env_bool("PPE_CONFIRM_ENABLED", True)
-CONF_INTERVAL_1H = _env_str("PPE_CONFIRM_INTERVAL", "1h")
-CONF_WINDOW_BARS = _env_int("PPE_CONFIRM_WINDOW_BARS", 6)          # N
-CONF_TRIGGER_BARS = _env_int("PPE_CONFIRM_TRIGGER_BARS", 3)        # 2–3
-
-PRICE_FLAT_PCT = _env_float("PPE_CONF_PRICE_FLAT_PCT", 0.003)      # 0.3%
-PRICE_MOVE_PCT = _env_float("PPE_CONF_PRICE_MOVE_PCT", 0.007)      # 0.7%
-OI_MOVE_PCT = _env_float("PPE_CONF_OI_MOVE_PCT", 0.01)             # +1%
-DELTA_RATIO_THR = _env_float("PPE_CONF_DELTA_RATIO_THR", 0.15)     # 0.15
-
-# CVD
-CVD_ENABLED = _env_bool("PPE_CVD_ENABLED", True)
-
-# Binance
-BINANCE_FAPI_BASE = _env_str("PPE_BINANCE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
-BINANCE_TIMEOUT_SEC = _env_int("PPE_BINANCE_TIMEOUT_SEC", 10)
-
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "polaris-phase-engine/3.0"})
-
-
-def _http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = BINANCE_TIMEOUT_SEC) -> Any:
-    last_exc: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            r = SESSION.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(0.25 * (attempt + 1))
-    raise RuntimeError(f"GET failed: {url} params={params} err={last_exc}")
-
-
-def _binance_fapi_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """
-    fapi/v1/klines returns:
-    [
-      open_time, open, high, low, close, volume, close_time,
-      quote_asset_volume, number_of_trades,
-      taker_buy_base_asset_volume, taker_buy_quote_asset_volume, ignore
+SESSION.headers.update({"User-Agent": "PolarisPhaseEngine/2.0-confv2-cache"})
+# ===================== BINANCE HELPERS ===================== #
+def _binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Load klines from Binance Futures (USDT-M)."""
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    resp = SESSION.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise RuntimeError(f"No klines for {symbol} interval={interval}")
+    cols = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
     ]
-    """
-    url = f"{BINANCE_FAPI_BASE}/fapi/v1/klines"
-    data = _http_get_json(url, params={"symbol": symbol, "interval": interval, "limit": limit})
-    if not isinstance(data, list) or not data:
-        return pd.DataFrame()
-
-    rows: List[Dict[str, Any]] = []
-    for k in data:
-        if not isinstance(k, list) or len(k) < 11:
-            continue
-        rows.append({
-            "open_time_ms": int(k[0]),
-            "open": _safe_float(k[1]),
-            "high": _safe_float(k[2]),
-            "low": _safe_float(k[3]),
-            "close": _safe_float(k[4]),
-            "volume": _safe_float(k[5]),
-            "close_time_ms": int(k[6]),
-            "quote_volume": _safe_float(k[7]),
-            "trades": int(_safe_float(k[8])),
-            "taker_buy_base": _safe_float(k[9]),
-            "taker_buy_quote": _safe_float(k[10]),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # drop still-forming candle if present (close_time in the future)
-    now_ms = int(time.time() * 1000)
-    df = df[df["close_time_ms"] <= now_ms].copy()
-    df.reset_index(drop=True, inplace=True)
+    df = pd.DataFrame(data, columns=cols)
+    num_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "taker_buy_base",
+        "taker_buy_quote",
+    ]
+    for c in num_cols:
+        df[c] = df[c].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
-
-
-def _binance_oi_hist(symbol: str, period: str, limit: int) -> pd.DataFrame:
+def _binance_open_interest_hist(symbol: str, period: str, limit: int) -> pd.DataFrame:
     """
-    /futures/data/openInterestHist
-    returns list of:
-    { "symbol": "...", "sumOpenInterest": "...", "sumOpenInterestValue": "...", "timestamp": 123 }
+    Binance OI history endpoint (USDT-M):
+    GET /futures/data/openInterestHist?symbol=...&period=...&limit=...
     """
-    url = f"{BINANCE_FAPI_BASE}/futures/data/openInterestHist"
-    data = _http_get_json(url, params={"symbol": symbol, "period": period, "limit": limit})
-    if not isinstance(data, list) or not data:
-        return pd.DataFrame()
-
-    rows: List[Dict[str, Any]] = []
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-        rows.append({
-            "ts_ms": int(_safe_float(it.get("timestamp", 0))),
-            "oi": _safe_float(it.get("sumOpenInterest", 0.0)),
-            "oi_value": _safe_float(it.get("sumOpenInterestValue", 0.0)),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    now_ms = int(time.time() * 1000)
-    df = df[df["ts_ms"] <= now_ms].copy()
-    df.sort_values("ts_ms", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    url = f"{BINANCE_FAPI}/futures/data/openInterestHist"
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    resp = SESSION.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise RuntimeError(f"No openInterestHist for {symbol} period={period}")
+    df = pd.DataFrame(data)
+    # expected fields: "sumOpenInterest", "sumOpenInterestValue", "timestamp"
+    if "timestamp" not in df.columns:
+        raise RuntimeError(f"Bad openInterestHist payload for {symbol}")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    for c in ("sumOpenInterest", "sumOpenInterestValue"):
+        if c in df.columns:
+            df[c] = df[c].astype(float)
+    df = df.sort_values("timestamp").reset_index(drop=True)
     return df
-
-
-def _binance_ticker_24h(symbol: str) -> Dict[str, Any]:
-    url = f"{BINANCE_FAPI_BASE}/fapi/v1/ticker/24hr"
-    data = _http_get_json(url, params={"symbol": symbol})
-    return data if isinstance(data, dict) else {}
-
-
-def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+# ===================== INDICATORS ===================== #
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+def _atr(df: pd.DataFrame, length: int) -> pd.Series:
     high = df["high"]
     low = df["low"]
     close = df["close"]
     prev_close = close.shift(1)
     tr = pd.concat(
         [
-            (high - low),
+            high - low,
             (high - prev_close).abs(),
             (low - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
-    atr = tr.rolling(period, min_periods=period).mean()
-    return atr
-
-
-def _zscore(s: pd.Series, window: int) -> pd.Series:
-    mean = s.rolling(window, min_periods=window).mean()
-    std = s.rolling(window, min_periods=window).std(ddof=0)
-    z = (s - mean) / std.replace(0, np.nan)
-    return z.fillna(0.0)
-
-
-def _phase_series(df: pd.DataFrame) -> pd.DataFrame:
+    return tr.rolling(length).mean()
+def _zscore(series: pd.Series, length: int) -> pd.Series:
+    roll = series.rolling(length)
+    mean = roll.mean()
+    std = roll.std(ddof=0).replace(0, np.nan)
+    return (series - mean) / std
+def _compute_cvd(df: pd.DataFrame) -> pd.Series:
     """
-    Adds:
-      ema20, ema50, trendDir, atr14, atrZ, volZ, phase
+    Simple CVD by aggressors:
+    delta = buy - sell = taker_buy_base - (volume - taker_buy_base)
     """
-    if df.empty or len(df) < 60:
-        return df
-
-    close = df["close"]
-    vol = df["volume"]
-
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-
-    trend = (ema20 - ema50) / ema50.replace(0, np.nan)
-    trend = trend.fillna(0.0)
-
-    trend_dir = np.where(trend > TREND_THR, 1, np.where(trend < -TREND_THR, -1, 0))
-
-    atr14 = _compute_atr(df, 14).fillna(method="bfill").fillna(0.0)
-    atr_z = _zscore(atr14, Z_WINDOW)
-    vol_z = _zscore(vol, Z_WINDOW)
-
-    phase = np.select(
-        [
-            (trend_dir == 1) & (atr_z > PH_ATR_Z_THR) & (vol_z > PH_VOL_Z_THR),
-            (trend_dir == -1) & (atr_z > PH_ATR_Z_THR) & (vol_z > PH_VOL_Z_THR),
-            (trend_dir == 0) & (atr_z < PH_ACC_ATR_Z_THR) & (vol_z < PH_ACC_VOL_Z_THR),
-        ],
-        ["PUMP", "DUMP", "ACCUM"],
-        default="CORR",
-    )
-
-    out = df.copy()
-    out["ema20"] = ema20
-    out["ema50"] = ema50
-    out["trend"] = trend
-    out["trendDir"] = trend_dir.astype(int)
-    out["atr14"] = atr14
-    out["atrZ"] = atr_z
-    out["volZ"] = vol_z
-    out["phase"] = phase
-    return out
-
-
-def _bars_in_same_phase(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
-    last = str(df["phase"].iloc[-1])
-    n = 0
-    for i in range(len(df) - 1, -1, -1):
-        if str(df["phase"].iloc[i]) != last:
-            break
-        n += 1
-    return n
-
-
-def _get_symbol_phase(symbol: str) -> Dict[str, Any]:
-    df = _binance_fapi_klines(symbol, INTERVAL_4H, KLINES_LIMIT_4H)
-    if df.empty or len(df) < 80:
-        return {"ok": False, "symbol": symbol, "interval": INTERVAL_4H, "error": "not enough klines"}
-
-    df = _phase_series(df)
-    if df.empty:
-        return {"ok": False, "symbol": symbol, "interval": INTERVAL_4H, "error": "phase calc failed"}
-
-    last = df.iloc[-1]
-    bars = _bars_in_same_phase(df)
-
-    phase = str(last["phase"])
-    pump_count = int(bars if phase == "PUMP" else 0)
-    dump_count = int(bars if phase == "DUMP" else 0)
-
-    close_time_ms = int(last["close_time_ms"])
-    close_ts = int(close_time_ms // 1000)
-
-    ema20 = float(last["ema20"])
-    atr14 = float(last["atr14"])
-    close = float(last["close"])
-
-    price_not_too_high = bool(close <= (ema20 + 2.0 * atr14)) if atr14 > 0 else True
-    price_not_too_low = bool(close >= (ema20 - 2.0 * atr14)) if atr14 > 0 else True
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "interval": INTERVAL_4H,
-        "time": _iso_utc(close_ts),
-        "ts": close_ts,
-        "phase": phase,
-        "trendDir": int(last["trendDir"]),
-        "atrZ": float(last["atrZ"]),
-        "volZ": float(last["volZ"]),
-        "barsInPhase": int(bars),
-        "pumpCount": pump_count,
-        "dumpCount": dump_count,
-        "close": close,
-        "ema20": ema20,
-        "atr14": atr14,
-        "priceNotTooHigh": price_not_too_high,
-        "priceNotTooLow": price_not_too_low,
-    }
-
-
-def _make_pre_signal(ph: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not ph.get("ok"):
-        return None
-
-    phase = str(ph.get("phase", ""))
-    trend_dir = int(ph.get("trendDir", 0))
-    bars = int(ph.get("barsInPhase", 0))
-
-    if phase == "PUMP" and trend_dir == 1 and bars >= MIN_BARS_IN_PHASE_FOR_PRE and bool(ph.get("priceNotTooHigh", True)):
-        return {
-            "symbol": ph["symbol"],
-            "side": "LONG",
-            "kind": "PRE",
-            "phase": "PUMP",
-            "interval": INTERVAL_4H,
-            "trendDir": trend_dir,
-            "barsInPhase": bars,
-            "generatedAt": int(ph.get("ts") or 0),
-            "price": float(ph.get("close") or 0.0),
-        }
-
-    if phase == "DUMP" and trend_dir == -1 and bars >= MIN_BARS_IN_PHASE_FOR_PRE and bool(ph.get("priceNotTooLow", True)):
-        return {
-            "symbol": ph["symbol"],
-            "side": "SHORT",
-            "kind": "PRE",
-            "phase": "DUMP",
-            "interval": INTERVAL_4H,
-            "trendDir": trend_dir,
-            "barsInPhase": bars,
-            "generatedAt": int(ph.get("ts") or 0),
-            "price": float(ph.get("close") or 0.0),
-        }
-
-    return None
-
-
+    buy = df["taker_buy_base"]
+    sell = df["volume"] - df["taker_buy_base"]
+    delta = buy - sell
+    return delta.cumsum()
+def _delta_ratio(df_win: pd.DataFrame) -> float:
+    """
+    delta_ratio = (CVD_end - CVD_start) / total_volume
+    in [-1..1] roughly (if taker volumes align).
+    """
+    if df_win.empty:
+        return 0.0
+    total_vol = float(df_win["volume"].sum())
+    if not np.isfinite(total_vol) or total_vol <= 0:
+        return 0.0
+    cvd = _compute_cvd(df_win)
+    d = float(cvd.iloc[-1] - cvd.iloc[0])
+    return d / total_vol
 def _price_change_pct(df_win: pd.DataFrame) -> float:
-    c0 = float(df_win["close"].iloc[0])
-    c1 = float(df_win["close"].iloc[-1])
-    return (c1 - c0) / c0 if c0 else 0.0
-
-
-def _oi_change_pct(oi_win: pd.DataFrame) -> float:
-    o0 = float(oi_win["oi"].iloc[0])
-    o1 = float(oi_win["oi"].iloc[-1])
-    return (o1 - o0) / o0 if o0 else 0.0
-
-
-def _cvd_metrics(df_win: pd.DataFrame) -> Tuple[float, float, float, float, float, float, float]:
-    """
-    Returns:
-      cvd_delta_base (sum delta over window),
-      cvd_delta_quote (sum delta_quote over window),
-      delta_ratio (abs(sum(delta))/sum(volume)),
-      last_delta_base,
-      last_delta_quote,
-      buy_vol_last,
-      taker_buy_pct_last
-    """
-    vol = df_win["volume"].astype(float)
-    buy = df_win["taker_buy_base"].astype(float)
-
-    # delta per bar: buy - sell = buy - (vol-buy) = 2*buy - vol
-    delta_base = (2.0 * buy) - vol
-    close = df_win["close"].astype(float)
-    delta_quote = delta_base * close
-
-    cvd_delta_base = float(delta_base.sum())
-    cvd_delta_quote = float(delta_quote.sum())
-
-    vol_sum = float(vol.sum())
-    delta_ratio = (abs(cvd_delta_base) / vol_sum) if vol_sum > 0 else 0.0
-
-    last_delta_base = float(delta_base.iloc[-1])
-    last_delta_quote = float(delta_quote.iloc[-1])
-    buy_vol_last = float(buy.iloc[-1])
-    vol_last = float(vol.iloc[-1])
-    taker_buy_pct_last = (buy_vol_last / vol_last) if vol_last > 0 else 0.0
-    return (
-        cvd_delta_base,
-        cvd_delta_quote,
-        delta_ratio,
-        last_delta_base,
-        last_delta_quote,
-        buy_vol_last,
-        taker_buy_pct_last,
+    if len(df_win) < 2:
+        return 0.0
+    p0 = float(df_win["close"].iloc[0])
+    p1 = float(df_win["close"].iloc[-1])
+    if p0 <= 0:
+        return 0.0
+    return (p1 - p0) / p0
+def _oi_change_pct(oi_df: pd.DataFrame) -> float:
+    if oi_df is None or oi_df.empty or len(oi_df) < 2:
+        return 0.0
+    col = "sumOpenInterestValue" if CONF_OI_VALUE_MODE == "value" else "sumOpenInterest"
+    if col not in oi_df.columns:
+        # fallback
+        col = "sumOpenInterestValue" if "sumOpenInterestValue" in oi_df.columns else "sumOpenInterest"
+        if col not in oi_df.columns:
+            return 0.0
+    v0 = float(oi_df[col].iloc[0])
+    v1 = float(oi_df[col].iloc[-1])
+    if not np.isfinite(v0) or v0 <= 0:
+        return 0.0
+    return (v1 - v0) / v0
+# ===================== PHASES 4H ===================== #
+def _classify_phases(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"]
+    ema_fast = _ema(close, EMA_FAST)
+    ema_slow = _ema(close, EMA_SLOW)
+    slope = (ema_fast - ema_slow) / ema_slow
+    trend_dir = np.where(
+        slope > TREND_UP_THR,
+        1,
+        np.where(slope < TREND_DN_THR, -1, 0),
     )
+    atr = _atr(df, ATR_LEN)
+    atr_z = _zscore(atr, ATR_Z_LEN)
+    vol_z = _zscore(df["volume"], VOL_Z_LEN)
+    regime = np.where(
+        (atr_z < ATR_QUIET) & (vol_z < VOL_QUIET),
+        "QUIET",
+        np.where((atr_z > ATR_HOT) & (vol_z > VOL_HOT), "HOT", "NORMAL"),
+    )
+    dist_fast = (close - ema_fast) / ema_fast
+    phase = np.full(len(df), "CORR", dtype=object)
+    # PUMP
+    phase[(trend_dir == 1) & (regime == "HOT") & (dist_fast > 0)] = "PUMP"
+    # DUMP
+    phase[(trend_dir == -1) & (regime == "HOT") & (dist_fast < 0)] = "DUMP"
+    # ACCUM
+    phase[(trend_dir >= 0) & (regime == "QUIET")] = "ACCUM"
+    # RANGE
+    phase[(regime == "QUIET") & (trend_dir == 0)] = "RANGE"
+    pump_count = np.zeros(len(df), dtype=int)
+    dump_count = np.zeros(len(df), dtype=int)
+    for i in range(len(df)):
+        if i == 0:
+            pump_count[i] = 1 if phase[i] == "PUMP" else 0
+            dump_count[i] = 1 if phase[i] == "DUMP" else 0
+        else:
+            if phase[i] == "PUMP":
+                pump_count[i] = pump_count[i - 1] + 1
+                dump_count[i] = 0
+            elif phase[i] == "DUMP":
+                dump_count[i] = dump_count[i - 1] + 1
+                pump_count[i] = 0
+            else:
+                pump_count[i] = 0
+                dump_count[i] = 0
 
-
-def _break_up(df: pd.DataFrame, bars: int) -> bool:
-    if df.empty or len(df) < bars + 1:
-        return False
-    c = float(df["close"].iloc[-1])
-    prev_high = float(df["high"].iloc[-(bars + 1):-1].max())
-    return c > prev_high
-
-
-def _break_down(df: pd.DataFrame, bars: int) -> bool:
-    if df.empty or len(df) < bars + 1:
-        return False
-    c = float(df["close"].iloc[-1])
-    prev_low = float(df["low"].iloc[-(bars + 1):-1].min())
-    return c < prev_low
-
-
-def _conf_context(ph: Dict[str, Any]) -> Dict[str, Any]:
-    phase = str(ph.get("phase", ""))
+    phased = pd.DataFrame(
+        {
+            "close_time": df["close_time"],
+            "close": close,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "trend_dir": trend_dir,
+            "atr": atr,
+            "atr_z": atr_z,
+            "vol_z": vol_z,
+            "regime": regime,
+            "phase": phase,
+            "pumpCount": pump_count,
+            "dumpCount": dump_count,
+        }
+    )
+    return phased
+def compute_phase_for_symbol(symbol: str) -> Dict[str, Any]:
+    try:
+        df = _binance_klines(symbol, INTERVAL, KLINES_LIMIT)
+    except Exception as exc:
+        logger.exception("Failed to load klines for %s: %s", symbol, exc)
+        return {"symbol": symbol, "error": str(exc)}
+    phased = _classify_phases(df)
+    last = phased.iloc[-1]
+    last_close_time = df["close_time"].iloc[-1]
+    last_high = df["high"].iloc[-1]
+    last_low = df["low"].iloc[-1]
     return {
-        "phase": phase,
-        "trendDir": int(ph.get("trendDir", 0)),
-        "pumpCount": int(ph.get("pumpCount", 0)),
-        "dumpCount": int(ph.get("dumpCount", 0)),
-        "barsInPhase": int(ph.get("barsInPhase", 0)),
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "phase": str(last["phase"]),
+        "trendDir": int(last["trend_dir"]),
+        "regime": str(last["regime"]),
+        "pumpCount": int(last["pumpCount"]),
+        "dumpCount": int(last["dumpCount"]),
+        "close": float(last["close"]),
+        "emaFast": float(last["ema_fast"]),
+        "emaSlow": float(last["ema_slow"]),
+        "atr": float(last["atr"]) if not pd.isna(last["atr"]) else None,
+        "atrZ": float(last["atr_z"]) if not pd.isna(last["atr_z"]) else None,
+        "volZ": float(last["vol_z"]) if not pd.isna(last["vol_z"]) else None,
+        "timestamp": int(last_close_time.timestamp()),
+        "high4h": float(last_high),
+        "low4h": float(last_low),
     }
 
-
-def _compute_conf_signals(symbol: str, ph: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not CONFIRM_ENABLED:
-        return []
-    if not CVD_ENABLED:
-        return []
-
-    w = max(2, CONF_WINDOW_BARS)
-    trig_bars = max(2, CONF_TRIGGER_BARS)
-
-    # Need a bit more than window for trigger check and safety
-    need_kl = max(80, w + trig_bars + 5)
-    df1 = _binance_fapi_klines(symbol, CONF_INTERVAL_1H, need_kl)
-    if df1.empty or len(df1) < (w + trig_bars + 1):
-        return []
-
-    # use last w + trig_bars bars as “current”
-    df_tail = df1.iloc[-(w + trig_bars + 1):].copy()
-
-    # window for metrics: last w bars ending at the last closed candle
-    df_win = df_tail.iloc[-w:].copy()
-
-    # OI aligned by count (good enough)
-    try:
-        oi_df = _binance_oi_hist(symbol, CONF_INTERVAL_1H, max(50, w + 5))
-        if oi_df.empty or len(oi_df) < 2:
-            return []
-        oi_win = oi_df.iloc[-(w + 1):].copy() if len(oi_df) >= (w + 1) else oi_df.copy()
-        oi_chg = _oi_change_pct(oi_win)
-    except Exception as exc:
-        logger.warning("CONF: OI not available for %s: %s", symbol, exc)
-        return []
-
-    pchg = _price_change_pct(df_win)
-
-    (
-        cvd_delta_base,
-        cvd_delta_quote,
-        delta_ratio,
-        last_delta_base,
-        last_delta_quote,
-        buy_vol_last,
-        taker_buy_pct_last,
-    ) = _cvd_metrics(df_win)
-
-    now_ts = int(int(df_tail["close_time_ms"].iloc[-1]) // 1000)
-
-    # Conditions (per TЗ)
-    oi_up = oi_chg >= OI_MOVE_PCT
-    oi_pos = oi_chg > 0.0
-
-    price_flat_up = pchg <= PRICE_FLAT_PCT           # “не выросла > 0.3%”
-    price_flat_dn = pchg >= -PRICE_FLAT_PCT          # “не просела > 0.3%”
-    price_up = pchg >= PRICE_MOVE_PCT
-    price_dn = pchg <= -PRICE_MOVE_PCT
-
-    cvd_pos = cvd_delta_base > 0
-    cvd_neg = cvd_delta_base < 0
-    delta_ok = delta_ratio >= DELTA_RATIO_THR
-
-    trig_up = _break_up(df_tail, trig_bars)
-    trig_dn = _break_down(df_tail, trig_bars)
-
-    ctx = _conf_context(ph)
-    phase4h = str(ctx.get("phase", ""))
-
+def compute_all_phases() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for symbol in SYMBOLS:
+        out[symbol] = compute_phase_for_symbol(symbol)
+    return out
+# ===================== SIGNALS: PRE ===================== #
+def _compute_pre_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
-
-    # LONG_1_ABSORB (dump context) + micro-break up
-    if (phase4h == "DUMP" or int(ctx.get("dumpCount", 0)) >= 2) and price_flat_dn and oi_up and cvd_neg and delta_ok and trig_up:
-        signals.append({
-            "symbol": symbol,
-            "side": "LONG",
-            "kind": "CONF",
-            "confirmType": "LONG_1_ABSORB",
-            "phase": phase4h,
-            "interval": INTERVAL_4H,
-            "triggerInterval": CONF_INTERVAL_1H,
-            "barsInPhase": int(ctx.get("dumpCount", 0)) or int(ctx.get("barsInPhase", 0)),
-            "trendDir": int(ctx.get("trendDir", 0)),
-            "generatedAt": now_ts,
-            "lookbackBars": w,
-            "triggerBars": trig_bars,
-            "priceChangePct": pchg,
-            "oiChangePct": oi_chg,
-            "cvdDeltaBase": cvd_delta_base,
-            "cvdDeltaQuote": cvd_delta_quote,
-            "deltaRatio": delta_ratio,
-            "info": {
-                "cvdLastBase": last_delta_base,
-                "cvdLastQuote": last_delta_quote,
-                "buyVolLast": buy_vol_last,
-                "sellVolLast": float(df_win["volume"].iloc[-1]) - buy_vol_last,
-                "takerBuyPctLast": taker_buy_pct_last,
-                "volLast": float(df_win["volume"].iloc[-1]),
-            },
-        })
-
-    # SHORT_1_ABSORB (pump context) + micro-break down
-    if (phase4h == "PUMP" or int(ctx.get("pumpCount", 0)) >= 2) and price_flat_up and oi_up and cvd_pos and delta_ok and trig_dn:
-        signals.append({
-            "symbol": symbol,
-            "side": "SHORT",
-            "kind": "CONF",
-            "confirmType": "SHORT_1_ABSORB",
-            "phase": phase4h,
-            "interval": INTERVAL_4H,
-            "triggerInterval": CONF_INTERVAL_1H,
-            "barsInPhase": int(ctx.get("pumpCount", 0)) or int(ctx.get("barsInPhase", 0)),
-            "trendDir": int(ctx.get("trendDir", 0)),
-            "generatedAt": now_ts,
-            "lookbackBars": w,
-            "triggerBars": trig_bars,
-            "priceChangePct": pchg,
-            "oiChangePct": oi_chg,
-            "cvdDeltaBase": cvd_delta_base,
-            "cvdDeltaQuote": cvd_delta_quote,
-            "deltaRatio": delta_ratio,
-            "info": {
-                "cvdLastBase": last_delta_base,
-                "cvdLastQuote": last_delta_quote,
-                "buyVolLast": buy_vol_last,
-                "sellVolLast": float(df_win["volume"].iloc[-1]) - buy_vol_last,
-                "takerBuyPctLast": taker_buy_pct_last,
-                "volLast": float(df_win["volume"].iloc[-1]),
-            },
-        })
-
-    # LONG_2_BREAK (participation up) + break up
-    if price_up and oi_pos and cvd_pos and delta_ok and trig_up:
-        signals.append({
-            "symbol": symbol,
-            "side": "LONG",
-            "kind": "CONF",
-            "confirmType": "LONG_2_BREAK",
-            "phase": phase4h,
-            "interval": INTERVAL_4H,
-            "triggerInterval": CONF_INTERVAL_1H,
-            "barsInPhase": int(ctx.get("barsInPhase", 0)),
-            "trendDir": int(ctx.get("trendDir", 0)),
-            "generatedAt": now_ts,
-            "lookbackBars": w,
-            "triggerBars": trig_bars,
-            "priceChangePct": pchg,
-            "oiChangePct": oi_chg,
-            "cvdDeltaBase": cvd_delta_base,
-            "cvdDeltaQuote": cvd_delta_quote,
-            "deltaRatio": delta_ratio,
-            "info": {
-                "cvdLastBase": last_delta_base,
-                "cvdLastQuote": last_delta_quote,
-                "buyVolLast": buy_vol_last,
-                "sellVolLast": float(df_win["volume"].iloc[-1]) - buy_vol_last,
-                "takerBuyPctLast": taker_buy_pct_last,
-                "volLast": float(df_win["volume"].iloc[-1]),
-            },
-        })
-
-    # SHORT_2_BREAK (participation down) + break down
-    if price_dn and oi_pos and cvd_neg and delta_ok and trig_dn:
-        signals.append({
-            "symbol": symbol,
-            "side": "SHORT",
-            "kind": "CONF",
-            "confirmType": "SHORT_2_BREAK",
-            "phase": phase4h,
-            "interval": INTERVAL_4H,
-            "triggerInterval": CONF_INTERVAL_1H,
-            "barsInPhase": int(ctx.get("barsInPhase", 0)),
-            "trendDir": int(ctx.get("trendDir", 0)),
-            "generatedAt": now_ts,
-            "lookbackBars": w,
-            "triggerBars": trig_bars,
-            "priceChangePct": pchg,
-            "oiChangePct": oi_chg,
-            "cvdDeltaBase": cvd_delta_base,
-            "cvdDeltaQuote": cvd_delta_quote,
-            "deltaRatio": delta_ratio,
-            "info": {
-                "cvdLastBase": last_delta_base,
-                "cvdLastQuote": last_delta_quote,
-                "buyVolLast": buy_vol_last,
-                "sellVolLast": float(df_win["volume"].iloc[-1]) - buy_vol_last,
-                "takerBuyPctLast": taker_buy_pct_last,
-                "volLast": float(df_win["volume"].iloc[-1]),
-            },
-        })
-
+    for symbol, info in phases.items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("error"):
+            continue
+        phase = info.get("phase")
+        pump_count = int(info.get("pumpCount") or 0)
+        dump_count = int(info.get("dumpCount") or 0)
+        if phase == "PUMP" and pump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL:
+            signals.append(
+                {
+                    "symbol": symbol,
+                    "side": "LONG",
+                    "kind": "PRE",
+                    "phase": phase,
+                    "barsInPhase": pump_count,
+                    "interval": info.get("interval"),
+                    "trendDir": info.get("trendDir"),
+                    "generatedAt": info.get("timestamp"),
+                }
+            )
+        elif phase == "DUMP" and dump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL:
+            signals.append(
+                {
+                    "symbol": symbol,
+                    "side": "SHORT",
+                    "kind": "PRE",
+                    "phase": phase,
+                    "barsInPhase": dump_count,
+                    "interval": info.get("interval"),
+                    "trendDir": info.get("trendDir"),
+                    "generatedAt": info.get("timestamp"),
+                }
+            )
     return signals
-
-
-# =========================
-# cache
-# =========================
-CACHE_LOCK = threading.Lock()
-CACHE: Dict[str, Any] = {
-    "updatedAt": 0,
-    "durationMs": 0,
-    "error": None,
+# ===================== SIGNALS: CONF v2 (LONG-1/2 SHORT-1/2) ===================== #
+def _conf_context(ph: Dict[str, Any]) -> Optional[str]:
+    """Return 'LONG' or 'SHORT' if PRE context is active right now, else None."""
+    if not ph or ph.get("error"):
+        return None
+    phase = ph.get("phase")
+    trend_dir = int(ph.get("trendDir") or 0)
+    pump_count = int(ph.get("pumpCount") or 0)
+    dump_count = int(ph.get("dumpCount") or 0)
+    if phase == "PUMP" and trend_dir > 0 and pump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL:
+        return "LONG"
+    if phase == "DUMP" and trend_dir < 0 and dump_count >= MIN_BARS_IN_PHASE_FOR_SIGNAL:
+        return "SHORT"
+    return None
+def _compute_conf_signals_v2(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not CONF_ENABLED:
+        return []
+    signals: List[Dict[str, Any]] = []
+    # ensure enough bars
+    w = max(3, CONF_WINDOW_BARS)
+    need_klines = max(CONF_KLINES_LIMIT, w + 2)
+    need_oi = w + 2
+    for symbol, ph in phases.items():
+        ctx = _conf_context(ph)
+        if ctx is None:
+            continue
+        try:
+            df = _binance_klines(symbol, CONF_INTERVAL, need_klines)
+        except Exception as exc:
+            logger.exception("CONF v2: failed to load %s %s klines: %s", symbol, CONF_INTERVAL, exc)
+            continue
+        if df.empty or len(df) < w + 2:
+            continue
+        # use the LAST closed window (avoid using the still-forming last candle if exchange returns it)
+        # Binance klines are closed bars; still, safer to just take last w+1 bars.
+        df_win = df.iloc[-(w + 1):].copy()
+        pchg = _price_change_pct(df_win)
+        dr = _delta_ratio(df_win)
+        # OI window aligned by count (not perfect time sync, but good enough for v1)
+        try:
+            oi_df = _binance_open_interest_hist(symbol, CONF_INTERVAL, need_oi)
+            if oi_df.empty or len(oi_df) < 2:
+                oi_chg = 0.0
+            else:
+                oi_df_win = oi_df.iloc[-(w + 1):].copy() if len(oi_df) >= (w + 1) else oi_df.copy()
+                oi_chg = _oi_change_pct(oi_df_win)
+        except Exception as exc:
+            # If OI is not available (some symbols / limits) -> skip CONF for this symbol
+            logger.warning("CONF v2: OI not available for %s: %s", symbol, exc)
+            continue
+        # Conditions
+        oi_up = oi_chg >= CONF_OI_MOVE_PCT
+        price_flat = abs(pchg) <= CONF_PRICE_FLAT_PCT
+        price_up = pchg >= CONF_PRICE_MOVE_PCT
+        price_dn = pchg <= -CONF_PRICE_MOVE_PCT
+        delta_pos = dr >= CONF_DELTA_RATIO_THR
+        delta_neg = dr <= -CONF_DELTA_RATIO_THR
+        now_ts = int(df_win["close_time"].iloc[-1].timestamp())
+        # LONG context
+        if ctx == "LONG":
+            # LONG-1: continuation impulse
+            if oi_up and price_up and delta_pos:
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "side": "LONG",
+                        "kind": "CONF",
+                        "confirmType": "LONG_2_BREAKOUT",
+                        "phase": ph.get("phase"),
+                        "interval": ph.get("interval"),           # 4h context
+                        "triggerInterval": CONF_INTERVAL,         # confirm TF
+                        "barsInPhase": int(ph.get("pumpCount") or 0),
+                        "trendDir": int(ph.get("trendDir") or 0),
+                        "generatedAt": now_ts,
+                        "windowBars": w,
+                        "priceChangePct": pchg,
+                        "oiChangePct": oi_chg,
+                        "deltaRatio": dr,
+                        "cvdDeltaQuote": cvd_last_quote,
+                        "cvdDeltaBase": cvd_last_base,
+                        "cvdQuote": cvd_quote,
+                        "takerBuyPctLast": taker_buy_pct_last,
+                        "volLast": vol_last,
+                        "oiMode": CONF_OI_VALUE_MODE,
+                    }
+                )
+            # LONG-2: absorption (selling pressure but price holds) -> re-accumulation before push
+            # OI up (new positions), delta negative (aggressive sells), but price flat (not falling)
+            if oi_up and price_flat and delta_neg:
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "side": "LONG",
+                        "kind": "CONF",
+                        "confirmType": "LONG_1_ABSORB",
+                        "phase": ph.get("phase"),
+                        "interval": ph.get("interval"),
+                        "triggerInterval": CONF_INTERVAL,
+                        "barsInPhase": int(ph.get("pumpCount") or 0),
+                        "trendDir": int(ph.get("trendDir") or 0),
+                        "generatedAt": now_ts,
+                        "windowBars": w,
+                        "priceChangePct": pchg,
+                        "oiChangePct": oi_chg,
+                        "deltaRatio": dr,
+                        "cvdDeltaQuote": cvd_last_quote,
+                        "cvdDeltaBase": cvd_last_base,
+                        "cvdQuote": cvd_quote,
+                        "takerBuyPctLast": taker_buy_pct_last,
+                        "volLast": vol_last,
+                        "oiMode": CONF_OI_VALUE_MODE,
+                    }
+                )
+        # SHORT context
+        if ctx == "SHORT":
+            # SHORT-1: continuation dump
+            if oi_up and price_dn and delta_neg:
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "side": "SHORT",
+                        "kind": "CONF",
+                        "confirmType": "SHORT_2_BREAKOUT",
+                        "phase": ph.get("phase"),
+                        "interval": ph.get("interval"),
+                        "triggerInterval": CONF_INTERVAL,
+                        "barsInPhase": int(ph.get("dumpCount") or 0),
+                        "trendDir": int(ph.get("trendDir") or 0),
+                        "generatedAt": now_ts,
+                        "windowBars": w,
+                        "priceChangePct": pchg,
+                        "oiChangePct": oi_chg,
+                        "deltaRatio": dr,
+                        "cvdDeltaQuote": cvd_last_quote,
+                        "cvdDeltaBase": cvd_last_base,
+                        "cvdQuote": cvd_quote,
+                        "takerBuyPctLast": taker_buy_pct_last,
+                        "volLast": vol_last,
+                        "oiMode": CONF_OI_VALUE_MODE,
+                    }
+                )
+            # SHORT-2: distribution (buyers push but price can't rise) -> bearish setup
+            # OI up (new positions), delta positive (aggressive buys), but price flat (not rising)
+            if oi_up and price_flat and delta_pos:
+                signals.append(
+                    {
+                        "symbol": symbol,
+                        "side": "SHORT",
+                        "kind": "CONF",
+                        "confirmType": "SHORT_1_ABSORB",
+                        "phase": ph.get("phase"),
+                        "interval": ph.get("interval"),
+                        "triggerInterval": CONF_INTERVAL,
+                        "barsInPhase": int(ph.get("dumpCount") or 0),
+                        "trendDir": int(ph.get("trendDir") or 0),
+                        "generatedAt": now_ts,
+                        "windowBars": w,
+                        "priceChangePct": pchg,
+                        "oiChangePct": oi_chg,
+                        "deltaRatio": dr,
+                        "cvdDeltaQuote": cvd_last_quote,
+                        "cvdDeltaBase": cvd_last_base,
+                        "cvdQuote": cvd_quote,
+                        "takerBuyPctLast": taker_buy_pct_last,
+                        "volLast": vol_last,
+                        "oiMode": CONF_OI_VALUE_MODE,
+                    }
+                )
+    return signals
+def compute_signals(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    pre = _compute_pre_signals(phases)
+    conf = _compute_conf_signals_v2(phases)
+    return pre + conf
+# ===================== CACHE (phases + signals) ===================== #
+_cache_lock = threading.Lock()
+_cache_state: Dict[str, Any] = {
     "phases": {},
     "signals": [],
+    "updatedAt": 0,
+    "durationMs": None,
+    "error": None,
 }
-
-
-def _refresh_cache_once() -> None:
+_refresh_in_progress = False
+def _cache_get() -> Dict[str, Any]:
+    with _cache_lock:
+        return dict(_cache_state)
+def _cache_set(phases: Dict[str, Any], signals: List[Dict[str, Any]], duration_ms: int) -> None:
+    with _cache_lock:
+        _cache_state["phases"] = phases
+        _cache_state["signals"] = signals
+        _cache_state["updatedAt"] = int(time.time())
+        _cache_state["durationMs"] = int(duration_ms)
+        _cache_state["error"] = None
+def _cache_set_error(err: str, duration_ms: int) -> None:
+    with _cache_lock:
+        _cache_state["updatedAt"] = int(time.time())
+        _cache_state["durationMs"] = int(duration_ms)
+        _cache_state["error"] = err
+def _refresh_cache_once(force: bool = False) -> None:
+    global _refresh_in_progress
+    if not CACHE_ENABLED:
+        return
+    with _cache_lock:
+        if _refresh_in_progress and not force:
+            return
+        _refresh_in_progress = True
     t0 = time.time()
-    err: Optional[str] = None
-    phases: Dict[str, Any] = {}
-    signals: List[Dict[str, Any]] = []
-
     try:
-        # phases + PRE
-        for sym in SYMBOLS:
-            ph = _get_symbol_phase(sym)
-            phases[sym] = ph
-            pre = _make_pre_signal(ph)
-            if pre:
-                signals.append(pre)
-
-        # CONF
-        if CONFIRM_ENABLED:
-            for sym in SYMBOLS:
-                ph = phases.get(sym) or {}
-                if ph.get("ok"):
-                    signals.extend(_compute_conf_signals(sym, ph))
-
+        phases = compute_all_phases()
+        signals = compute_signals(phases)
+        dur = int((time.time() - t0) * 1000)
+        _cache_set(phases, signals, dur)
+        logger.info("Cache refreshed: symbols=%d signals=%d %dms", len(phases), len(signals), dur)
     except Exception as exc:
-        err = str(exc)
+        dur = int((time.time() - t0) * 1000)
         logger.exception("Cache refresh failed: %s", exc)
-
-    dt_ms = int((time.time() - t0) * 1000)
-    with CACHE_LOCK:
-        CACHE["updatedAt"] = _now_ts()
-        CACHE["durationMs"] = dt_ms
-        CACHE["error"] = err
-        CACHE["phases"] = phases
-        CACHE["signals"] = signals
-
-    logger.info("Cache refreshed: symbols=%d signals=%d %dms", len(SYMBOLS), len(signals), dt_ms)
-
-
+        _cache_set_error(str(exc), dur)
+    finally:
+        with _cache_lock:
+            _refresh_in_progress = False
 def _cache_loop() -> None:
+    if CACHE_STARTUP_REFRESH:
+        _refresh_cache_once(force=True)
     while True:
-        _refresh_cache_once()
         time.sleep(max(5, CACHE_REFRESH_SEC))
-
-
-# =========================
-# HTTP
-# =========================
+        _refresh_cache_once()
+# ===================== FLASK HTTP ===================== #
 app = Flask(__name__)
-
-
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health() -> Any:
-    with CACHE_LOCK:
-        updated_at = int(CACHE.get("updatedAt") or 0)
-        duration_ms = int(CACHE.get("durationMs") or 0)
-        err = CACHE.get("error")
-
-    age = max(0, _now_ts() - updated_at) if updated_at else 0
-
-    payload = {
-        "status": "ok",
-        "symbols": SYMBOLS,
-        "interval": INTERVAL_4H,
-        "confirmEnabled": bool(CONFIRM_ENABLED),
-        "confirmInterval": CONF_INTERVAL_1H,
-        "cvdEnabled": bool(CVD_ENABLED),
-        "cvdWindowBars": int(CONF_WINDOW_BARS),
-        "cacheEnabled": bool(CACHE_ENABLED),
-        "cacheRefreshSec": int(CACHE_REFRESH_SEC),
-        "cacheUpdatedAt": updated_at,
-        "cacheAgeSec": age,
-        "cacheDurationMs": duration_ms,
-        "cacheError": err,
-    }
-    return jsonify(payload)
-
-
-@app.get("/phases")
-def phases() -> Any:
-    with CACHE_LOCK:
-        ph = CACHE.get("phases") or {}
-    return jsonify(ph)
-
-
-@app.get("/signals")
-def signals() -> Any:
-    with CACHE_LOCK:
-        sigs = CACHE.get("signals") or []
-    return jsonify({"signals": sigs})
-
-
+    st = _cache_get() if CACHE_ENABLED else None
+    age = None
+    if st and st.get("updatedAt"):
+        age = int(time.time() - int(st["updatedAt"]))
+    return jsonify(
+        {
+            "status": "ok",
+            "symbols": SYMBOLS,
+            "interval": INTERVAL,
+            "confirmEnabled": CONF_ENABLED,
+            "confirmInterval": CONF_INTERVAL,
+            "cacheEnabled": CACHE_ENABLED,
+            "cacheRefreshSec": CACHE_REFRESH_SEC if CACHE_ENABLED else None,
+            "cacheUpdatedAt": st.get("updatedAt") if st else None,
+            "cacheAgeSec": age,
+            "cacheDurationMs": st.get("durationMs") if st else None,
+            "cacheError": st.get("error") if st else None,
+        }
+    )
+@app.route("/phases", methods=["GET"])
+def phases_endpoint() -> Any:
+    if CACHE_ENABLED:
+        st = _cache_get()
+        if not st.get("updatedAt"):
+            _refresh_cache_once(force=True)
+            st = _cache_get()
+        return jsonify(st.get("phases", {}))
+    phases = compute_all_phases()
+    return jsonify(phases)
+@app.route("/signals", methods=["GET"])
+def signals_endpoint() -> Any:
+    if CACHE_ENABLED:
+        st = _cache_get()
+        if not st.get("updatedAt"):
+            _refresh_cache_once(force=True)
+            st = _cache_get()
+        return jsonify({"signals": st.get("signals", [])})
+    phases = compute_all_phases()
+    signals = compute_signals(phases)
+    return jsonify({"signals": signals})
 def main() -> None:
     logger.info(
-        "Starting Polaris Phase Engine on %s:%s symbols=%s interval=%s confirm=%s/%s cvd=%s window=%s cache=%s refresh=%ss",
+        "Starting Polaris Phase Engine on %s:%s symbols=%s interval=%s confirm=%s/%s cache=%s refresh=%ss",
         HTTP_HOST,
         HTTP_PORT,
         ",".join(SYMBOLS),
-        INTERVAL_4H,
-        "on" if CONFIRM_ENABLED else "off",
-        CONF_INTERVAL_1H,
-        "on" if CVD_ENABLED else "off",
-        CONF_WINDOW_BARS,
+        INTERVAL,
+        "on" if CONF_ENABLED else "off",
+        CONF_INTERVAL,
         "on" if CACHE_ENABLED else "off",
         CACHE_REFRESH_SEC,
     )
-
     if CACHE_ENABLED:
-        th = threading.Thread(target=_cache_loop, name="cache-loop", daemon=True)
-        th.start()
-    else:
-        _refresh_cache_once()
-
+        t = threading.Thread(target=_cache_loop, name="ppe-cache", daemon=True)
+        t.start()
     app.run(host=HTTP_HOST, port=HTTP_PORT)
-
-
 if __name__ == "__main__":
     main()
